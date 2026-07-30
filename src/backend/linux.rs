@@ -149,6 +149,7 @@ pub struct X11Session {
     accepted_target: Option<XWindow>,
     released_target: Option<XdndTarget>,
     drop_target: Option<XdndTarget>,
+    payload_served: bool,
     last_event_time: u32,
     reporter: SessionReporter,
     finished: bool,
@@ -209,6 +210,7 @@ impl X11Session {
             accepted_target: None,
             released_target: None,
             drop_target: None,
+            payload_served: false,
             last_event_time: press.time,
             reporter,
             finished: false,
@@ -330,11 +332,22 @@ impl X11Session {
         event: &ButtonReleaseEvent,
     ) -> Result<(), X11SessionError> {
         self.note_event_time(event.time);
-        self.update_target(conn, event.root_x, event.root_y)?;
+        let target = self.find_xdnd_target(conn, event.root_x, event.root_y)?;
+        if target != self.current_target {
+            self.leave_current_target(conn)?;
+            self.current_target = target;
+            if let Some(target) = target {
+                self.send_enter(conn, target)?;
+                self.send_position(conn, target, event.root_x, event.root_y)?;
+            }
+        }
         let Some(target) = self.current_target else {
             return self.finish(conn, LinuxOutcome::Cancelled);
         };
         self.released_target = Some(target);
+        if self.accepted_target == Some(target.logical) {
+            self.send_drop(conn, target)?;
+        }
         Ok(())
     }
 
@@ -351,6 +364,9 @@ impl X11Session {
             [self.source_window, 0, self.last_event_time, 0, 0],
         )?;
         self.reporter.drop_performed();
+        if self.payload_served {
+            self.finish(conn, LinuxOutcome::Exported)?;
+        }
         Ok(())
     }
 
@@ -431,6 +447,7 @@ impl X11Session {
             self.send_selection_notify(conn, event, property)?;
         } else if self.is_payload_target(event.target) {
             self.reporter.data_requested();
+            self.payload_served = true;
             let payload = if event.target == self.atoms.x_special_gnome_copied_files {
                 self.file_payload.gnome_copied_files()
             } else if event.target == self.atoms.text_plain_utf8
@@ -454,7 +471,11 @@ impl X11Session {
         } else {
             self.send_selection_notify(conn, event, AtomEnum::NONE.into())?;
         }
-        conn.flush().map_err(x11_error)
+        conn.flush().map_err(x11_error)?;
+        if self.drop_target.is_some() && self.payload_served {
+            self.finish(conn, LinuxOutcome::Exported)?;
+        }
+        Ok(())
     }
 
     fn send_selection_notify<C: Connection>(

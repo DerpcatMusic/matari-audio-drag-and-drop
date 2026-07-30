@@ -2,6 +2,7 @@
 
 ## 0.1.1 - Unreleased
 
+- Complete XWayland-to-Wayland bridge drops from accepted protocol and payload-transfer events without waiting indefinitely for a duplicate status or finish message.
 - Free Windows transfer allocations when native memory locking fails.
 - Document native unsafe invariants and the public X11 event lifecycle.
 - Enforce the declared Rust 1.95 MSRV, dependency policy, strict native unsafe
