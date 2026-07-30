@@ -5,9 +5,13 @@ mod facade;
 mod file_payload;
 #[cfg(not(all(target_family = "unix", not(target_os = "macos"))))]
 mod platform;
+mod preview;
+mod wayland;
 
 pub use file_payload::FileDragOffer;
 pub(crate) use file_payload::FileDragPayloadData;
+pub use preview::{DragPreview, MidiPreviewNote};
+pub use wayland::WaylandSourceReporter;
 
 #[cfg(all(target_family = "unix", not(target_os = "macos")))]
 pub use backend::{X11PointerEvent, X11Session, X11SessionError, X11SessionStatus, X11StartError};

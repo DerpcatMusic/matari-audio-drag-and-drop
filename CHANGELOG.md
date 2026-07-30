@@ -3,6 +3,8 @@
 ## 0.1.1 - Unreleased
 
 - Make XWayland-to-Wayland bridge transfers non-blocking after accepted protocol and payload-transfer events while retaining selection ownership and final authority for the target.
+- Restore waveform, spectrogram, and MIDI source previews for event-driven X11/XWayland drags.
+- Add a reusable native-Wayland lifecycle reporter that becomes replaceable only after both payload delivery and a compositor drop event.
 - Coalesce repeated native progress notifications into one data-request and one drop-performed event per drag.
 - Free Windows transfer allocations when native memory locking fails.
 - Document native unsafe invariants and the public X11 event lifecycle.

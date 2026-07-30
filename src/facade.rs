@@ -25,6 +25,7 @@ use raw_window_handle::{
 #[derive(Debug)]
 pub struct FileSet {
     paths: Box<[PathBuf]>,
+    preview: Option<crate::DragPreview>,
 }
 
 impl FileSet {
@@ -58,7 +59,15 @@ impl FileSet {
 
         Ok(Self {
             paths: paths.into_boxed_slice(),
+            preview: None,
         })
+    }
+
+    /// Attach source-side preview data to the file set.
+    #[must_use]
+    pub fn with_preview(mut self, preview: crate::DragPreview) -> Self {
+        self.preview = Some(preview);
+        self
     }
 
     /// Validated paths.
@@ -78,10 +87,20 @@ impl FileSet {
         crate::FileDragPayloadData::from_validated(self.paths.to_vec()).offers()
     }
 
+    /// Source-side preview data, when supplied by the application.
+    #[must_use]
+    pub fn preview(&self) -> Option<&crate::DragPreview> {
+        self.preview.as_ref()
+    }
+
     /// Consume the validated paths.
     #[must_use]
     pub fn into_paths(self) -> Vec<PathBuf> {
         self.paths.into_vec()
+    }
+
+    pub(crate) fn into_parts(self) -> (Vec<PathBuf>, Option<crate::DragPreview>) {
+        (self.paths.into_vec(), self.preview)
     }
 }
 

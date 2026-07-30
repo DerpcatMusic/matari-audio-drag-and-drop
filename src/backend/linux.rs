@@ -12,8 +12,9 @@ use x11rb::CURRENT_TIME;
 use x11rb::connection::Connection;
 use x11rb::protocol::Event;
 use x11rb::protocol::xproto::{
-    Atom, AtomEnum, ButtonReleaseEvent, ClientMessageEvent, ConnectionExt, EventMask, PropMode,
-    SelectionNotifyEvent, SelectionRequestEvent, Window as XWindow,
+    Atom, AtomEnum, ButtonReleaseEvent, ClientMessageEvent, ConfigureWindowAux, ConnectionExt,
+    CreateGCAux, CreateWindowAux, EventMask, Gcontext, ImageFormat, PropMode, SelectionNotifyEvent,
+    SelectionRequestEvent, StackMode, Window as XWindow, WindowClass,
 };
 use x11rb::wrapper::ConnectionExt as _;
 
@@ -139,6 +140,110 @@ impl XdndAtoms {
     }
 }
 
+struct PreviewWindow {
+    window: XWindow,
+    gc: Gcontext,
+    depth: u8,
+    pixels: Vec<u8>,
+}
+
+impl PreviewWindow {
+    const OFFSET_X: i32 = 20;
+    const OFFSET_Y: i32 = 22;
+
+    fn new<C: Connection>(
+        conn: &C,
+        root: XWindow,
+        root_x: i16,
+        root_y: i16,
+        preview: &crate::DragPreview,
+    ) -> Result<Self, X11SessionError> {
+        let screen = conn
+            .setup()
+            .roots
+            .iter()
+            .find(|screen| screen.root == root)
+            .ok_or_else(|| X11SessionError::new("X11 drag root has no matching screen"))?;
+        let window = conn.generate_id().map_err(x11_error)?;
+        conn.create_window(
+            screen.root_depth,
+            window,
+            root,
+            -10_000,
+            -10_000,
+            crate::preview::WIDTH as u16,
+            crate::preview::HEIGHT as u16,
+            0,
+            WindowClass::INPUT_OUTPUT,
+            screen.root_visual,
+            &CreateWindowAux::new()
+                .override_redirect(1)
+                .background_pixel(0)
+                .event_mask(EventMask::EXPOSURE),
+        )
+        .map_err(x11_error)?;
+        let gc = conn.generate_id().map_err(x11_error)?;
+        if let Err(error) = conn.create_gc(gc, window, &CreateGCAux::new()) {
+            let _ = conn.destroy_window(window);
+            return Err(x11_error(error));
+        }
+        let preview = Self {
+            window,
+            gc,
+            depth: screen.root_depth,
+            pixels: crate::preview::render(preview),
+        };
+        if let Err(error) = conn.map_window(window).map_err(x11_error) {
+            preview.destroy(conn);
+            return Err(error);
+        }
+        if let Err(error) = preview.move_to(conn, root_x, root_y) {
+            preview.destroy(conn);
+            return Err(error);
+        }
+        Ok(preview)
+    }
+
+    fn move_to<C: Connection>(
+        &self,
+        conn: &C,
+        root_x: i16,
+        root_y: i16,
+    ) -> Result<(), X11SessionError> {
+        conn.configure_window(
+            self.window,
+            &ConfigureWindowAux::new()
+                .x(i32::from(root_x) + Self::OFFSET_X)
+                .y(i32::from(root_y) + Self::OFFSET_Y)
+                .stack_mode(StackMode::ABOVE),
+        )
+        .map_err(x11_error)?;
+        self.draw(conn)
+    }
+
+    fn draw<C: Connection>(&self, conn: &C) -> Result<(), X11SessionError> {
+        conn.put_image(
+            ImageFormat::Z_PIXMAP,
+            self.window,
+            self.gc,
+            crate::preview::WIDTH as u16,
+            crate::preview::HEIGHT as u16,
+            0,
+            0,
+            0,
+            self.depth,
+            &self.pixels,
+        )
+        .map_err(x11_error)?;
+        conn.flush().map_err(x11_error)
+    }
+
+    fn destroy<C: Connection>(self, conn: &C) {
+        let _ = conn.free_gc(self.gc);
+        let _ = conn.destroy_window(self.window);
+    }
+}
+
 /// XDND state owned by the toolkit event loop that owns the X11 connection.
 pub struct X11Session {
     atoms: XdndAtoms,
@@ -151,6 +256,7 @@ pub struct X11Session {
     drop_target: Option<XdndTarget>,
     payload_served: bool,
     transfer_complete: bool,
+    preview: Option<PreviewWindow>,
     last_event_time: u32,
     reporter: SessionReporter,
     finished: bool,
@@ -189,6 +295,7 @@ impl X11Session {
             ));
         }
 
+        let (paths, preview) = files.into_parts();
         let atoms = XdndAtoms::new(conn)?;
         conn.set_selection_owner(source_window, atoms.xdnd_selection, press.time)
             .map_err(x11_error)?;
@@ -202,22 +309,29 @@ impl X11Session {
             return Err(X11SessionError::new("could not own XdndSelection"));
         }
 
+        let preview = preview.and_then(|preview| {
+            PreviewWindow::new(conn, press.root, press.root_x, press.root_y, &preview).ok()
+        });
         let mut session = Self {
             atoms,
             root: press.root,
             source_window,
-            file_payload: FileDragPayloadData::from_validated(files.into_paths()),
+            file_payload: FileDragPayloadData::from_validated(paths),
             current_target: None,
             accepted_target: None,
             released_target: None,
             drop_target: None,
             payload_served: false,
             transfer_complete: false,
+            preview,
             last_event_time: press.time,
             reporter,
             finished: false,
         };
         if let Err(error) = session.update_target(conn, press.root_x, press.root_y) {
+            if let Some(preview) = session.preview.take() {
+                preview.destroy(conn);
+            }
             let _ = conn.set_selection_owner(x11rb::NONE, session.atoms.xdnd_selection, press.time);
             let _ = conn.flush();
             return Err(error);
@@ -237,6 +351,9 @@ impl X11Session {
         }
 
         if let Err(error) = self.drive_event(conn, event) {
+            if let Some(preview) = self.preview.take() {
+                preview.destroy(conn);
+            }
             let _ = self.leave_current_target(conn);
             let _ = conn.set_selection_owner(
                 x11rb::NONE,
@@ -277,6 +394,9 @@ impl X11Session {
             {
                 self.note_event_time(event.time);
                 self.update_target(conn, event.root_x, event.root_y)?;
+                if let Some(preview) = &self.preview {
+                    preview.move_to(conn, event.root_x, event.root_y)?;
+                }
             }
             Event::ButtonRelease(event)
                 if event.detail == 1
@@ -294,6 +414,16 @@ impl X11Session {
             Event::SelectionRequest(event) => {
                 self.handle_selection_request(conn, event)?;
             }
+            Event::Expose(event)
+                if self
+                    .preview
+                    .as_ref()
+                    .is_some_and(|preview| preview.window == event.window) =>
+            {
+                if let Some(preview) = &self.preview {
+                    preview.draw(conn)?;
+                }
+            }
             Event::SelectionClear(event) if event.selection == self.atoms.xdnd_selection => {
                 self.finish(conn, LinuxOutcome::Cancelled)?;
             }
@@ -305,6 +435,9 @@ impl X11Session {
     /// Cancel from an authoritative toolkit teardown or gesture-cancel event.
     pub fn cancel<C: Connection>(mut self, conn: &C) -> Result<(), X11SessionError> {
         if !self.finished {
+            if let Some(preview) = self.preview.take() {
+                preview.destroy(conn);
+            }
             self.leave_current_target(conn)?;
             self.finish(conn, LinuxOutcome::Cancelled)?;
         }
@@ -317,6 +450,9 @@ impl X11Session {
     /// `XdndLeave`. The target action remains unconfirmed.
     pub fn supersede<C: Connection>(mut self, conn: &C) -> Result<(), X11SessionError> {
         if !self.finished {
+            if let Some(preview) = self.preview.take() {
+                preview.destroy(conn);
+            }
             conn.set_selection_owner(x11rb::NONE, self.atoms.xdnd_selection, self.last_event_time)
                 .map_err(x11_error)?;
             conn.flush().map_err(x11_error)?;
@@ -358,6 +494,9 @@ impl X11Session {
         event: &ButtonReleaseEvent,
     ) -> Result<(), X11SessionError> {
         self.note_event_time(event.time);
+        if let Some(preview) = self.preview.take() {
+            preview.destroy(conn);
+        }
         let target = self.find_xdnd_target(conn, event.root_x, event.root_y)?;
         if target != self.current_target {
             self.leave_current_target(conn)?;
@@ -558,7 +697,10 @@ impl X11Session {
                 .reply()
                 .map_err(x11_error)?;
             let child = tree.children.iter().rev().copied().find(|&candidate| {
-                self.window_contains_root_point(conn, candidate, root_x, root_y)
+                self.preview
+                    .as_ref()
+                    .is_none_or(|preview| candidate != preview.window)
+                    && self.window_contains_root_point(conn, candidate, root_x, root_y)
             });
             let Some(child) = child else {
                 return Ok((current != self.source_window).then_some(current));
@@ -741,6 +883,9 @@ impl X11Session {
         conn: &C,
         outcome: LinuxOutcome,
     ) -> Result<(), X11SessionError> {
+        if let Some(preview) = self.preview.take() {
+            preview.destroy(conn);
+        }
         conn.set_selection_owner(x11rb::NONE, self.atoms.xdnd_selection, self.last_event_time)
             .map_err(x11_error)?;
         conn.flush().map_err(x11_error)?;
