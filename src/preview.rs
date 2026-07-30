@@ -137,7 +137,7 @@ fn midi(pixels: &mut [u8], notes: &[MidiPreviewNote]) {
     }
     for note in notes.iter().take(96) {
         let start = note.start.clamp(0.0, 1.0);
-        let end = note.end.clamp(start + 0.01, 1.0);
+        let end = note.end.max(start + 0.01).clamp(0.0, 1.0);
         let height = (DRAW_HEIGHT / 18.0).clamp(3.0, 7.0);
         fill_rect(
             pixels,

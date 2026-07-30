@@ -245,6 +245,7 @@ impl PreviewWindow {
 }
 
 /// XDND state owned by the toolkit event loop that owns the X11 connection.
+#[must_use = "the toolkit must drive this session or explicitly cancel it before teardown"]
 pub struct X11Session {
     atoms: XdndAtoms,
     root: XWindow,
@@ -394,9 +395,7 @@ impl X11Session {
             {
                 self.note_event_time(event.time);
                 self.update_target(conn, event.root_x, event.root_y)?;
-                if let Some(preview) = &self.preview {
-                    preview.move_to(conn, event.root_x, event.root_y)?;
-                }
+                self.move_preview(conn, event.root_x, event.root_y);
             }
             Event::ButtonRelease(event)
                 if event.detail == 1
@@ -420,9 +419,7 @@ impl X11Session {
                     .as_ref()
                     .is_some_and(|preview| preview.window == event.window) =>
             {
-                if let Some(preview) = &self.preview {
-                    preview.draw(conn)?;
-                }
+                self.redraw_preview(conn);
             }
             Event::SelectionClear(event) if event.selection == self.atoms.xdnd_selection => {
                 self.finish(conn, LinuxOutcome::Cancelled)?;
@@ -465,6 +462,26 @@ impl X11Session {
     fn note_event_time(&mut self, time: u32) {
         if time != CURRENT_TIME {
             self.last_event_time = time;
+        }
+    }
+
+    fn move_preview<C: Connection>(&mut self, conn: &C, root_x: i16, root_y: i16) {
+        let failed = self
+            .preview
+            .as_ref()
+            .is_some_and(|preview| preview.move_to(conn, root_x, root_y).is_err());
+        if failed && let Some(preview) = self.preview.take() {
+            preview.destroy(conn);
+        }
+    }
+
+    fn redraw_preview<C: Connection>(&mut self, conn: &C) {
+        let failed = self
+            .preview
+            .as_ref()
+            .is_some_and(|preview| preview.draw(conn).is_err());
+        if failed && let Some(preview) = self.preview.take() {
+            preview.destroy(conn);
         }
     }
 
