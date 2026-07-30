@@ -325,6 +325,8 @@ pub enum LinuxOutcome {
     Failed(LinuxFailure),
     /// The user or protocol cancelled the transfer.
     Cancelled,
+    /// Data was transferred, but the target never confirmed its final action.
+    Indeterminate,
 }
 
 /// Typed controller event.
@@ -405,6 +407,7 @@ enum TicketEvent {
     },
     DataRequested(SessionId<Outbound>),
     DropPerformed(SessionId<Outbound>),
+    TransferReady(SessionId<Outbound>),
     Terminal {
         session: SessionId<Outbound>,
         outcome: Outcome,
@@ -913,6 +916,14 @@ impl SessionReporter {
         }
     }
 
+    /// Report that accepted protocol state and transferred data make this
+    /// session replaceable while the native target retains final authority.
+    pub fn transfer_ready(&self) {
+        if !self.terminal.load(Ordering::Acquire) {
+            self.delivery.emit(TicketEvent::TransferReady(self.session));
+        }
+    }
+
     /// Finish a Linux session with a typed terminal result.
     pub fn finish_linux(&self, outcome: LinuxOutcome) {
         self.finish(Outcome::Linux(outcome));
@@ -1245,6 +1256,7 @@ struct ActiveOutbound {
     session: SessionId<Outbound>,
     data_requested: bool,
     drop_performed: bool,
+    replaceable: bool,
 }
 
 impl Controller {
@@ -1278,7 +1290,9 @@ impl Controller {
         adapter: &mut A,
         files: FileSet,
     ) -> Result<SessionId<Outbound>, StartError<A::Error>> {
-        if let Some(active) = self.active_outbound {
+        if let Some(active) = self.active_outbound
+            && !active.replaceable
+        {
             return Err(StartError::Busy {
                 active: active.session,
             });
@@ -1287,6 +1301,13 @@ impl Controller {
         let Some(route) = adapter.outbound_route() else {
             return Err(StartError::NoRoute);
         };
+
+        if let Some(active) = self.active_outbound.take() {
+            self.pending.push(SessionEvent::OutboundTerminal {
+                session: active.session,
+                outcome: Outcome::Linux(LinuxOutcome::Indeterminate),
+            });
+        }
 
         let session = SessionId::new(take_session_id(&mut self.next_session));
         let ticket = StartTicket {
@@ -1301,6 +1322,7 @@ impl Controller {
             session,
             data_requested: false,
             drop_performed: false,
+            replaceable: false,
         });
 
         match adapter.schedule_outbound(ticket) {
@@ -1354,6 +1376,13 @@ impl Controller {
         self.active_outbound.map(|active| active.session)
     }
 
+    /// Whether a native outbound session must block a new drag gesture.
+    #[must_use]
+    pub fn outbound_in_flight(&self) -> bool {
+        self.active_outbound
+            .is_some_and(|active| !active.replaceable)
+    }
+
     fn accept_ticket_event(&mut self, event: TicketEvent) {
         match event {
             TicketEvent::Started { session, route } if self.is_live(session) => {
@@ -1376,6 +1405,13 @@ impl Controller {
                 {
                     active.drop_performed = true;
                     self.pending.push(SessionEvent::DropPerformed { session });
+                }
+            }
+            TicketEvent::TransferReady(session) => {
+                if let Some(active) = &mut self.active_outbound
+                    && active.session == session
+                {
+                    active.replaceable = true;
                 }
             }
             TicketEvent::Terminal { session, outcome } if self.is_live(session) => {

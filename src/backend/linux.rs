@@ -311,6 +311,21 @@ impl X11Session {
         Ok(())
     }
 
+    /// Retire a transfer-ready session when a new drag gesture supersedes it.
+    ///
+    /// A drop was already sent, so this deliberately does not send
+    /// `XdndLeave`. The target action remains unconfirmed.
+    pub fn supersede<C: Connection>(mut self, conn: &C) -> Result<(), X11SessionError> {
+        if !self.finished {
+            conn.set_selection_owner(x11rb::NONE, self.atoms.xdnd_selection, self.last_event_time)
+                .map_err(x11_error)?;
+            conn.flush().map_err(x11_error)?;
+            self.finished = true;
+            self.reporter.finish_linux(LinuxOutcome::Indeterminate);
+        }
+        Ok(())
+    }
+
     fn note_event_time(&mut self, time: u32) {
         if time != CURRENT_TIME {
             self.last_event_time = time;
@@ -376,7 +391,7 @@ impl X11Session {
         )?;
         self.reporter.drop_performed();
         if self.payload_served {
-            self.report_exported();
+            self.mark_transfer_ready();
         }
         Ok(())
     }
@@ -484,7 +499,7 @@ impl X11Session {
         }
         conn.flush().map_err(x11_error)?;
         if self.drop_target.is_some() && self.payload_served {
-            self.report_exported();
+            self.mark_transfer_ready();
         }
         Ok(())
     }
@@ -713,9 +728,12 @@ impl X11Session {
         self.offered_targets().contains(&target)
     }
 
-    fn report_exported(&mut self) {
+    fn mark_transfer_ready(&mut self) {
+        if self.transfer_complete {
+            return;
+        }
         self.transfer_complete = true;
-        self.reporter.finish_linux(LinuxOutcome::Exported);
+        self.reporter.transfer_ready();
     }
 
     fn finish<C: Connection>(
