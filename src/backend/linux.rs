@@ -262,7 +262,7 @@ pub struct X11Session {
     target_acceptance: TargetAcceptance,
     released_target: Option<XdndTarget>,
     drop_target: Option<XdndTarget>,
-    payload_served: bool,
+    payload_target: Option<XWindow>,
     transfer_complete: bool,
     pointer_grabbed: bool,
     preview: Option<PreviewWindow>,
@@ -364,7 +364,7 @@ impl X11Session {
             target_acceptance: TargetAcceptance::Unknown,
             released_target: None,
             drop_target: None,
-            payload_served: false,
+            payload_target: None,
             transfer_complete: false,
             pointer_grabbed: true,
             preview,
@@ -590,19 +590,7 @@ impl X11Session {
             return self.finish(conn, LinuxOutcome::Cancelled);
         };
         self.released_target = Some(target);
-        match self.target_acceptance {
-            TargetAcceptance::Accepted(logical) if logical == target.logical => {
-                self.send_drop(conn, target)?;
-            }
-            TargetAcceptance::Rejected(logical) if logical == target.logical => {
-                self.leave_current_target(conn)?;
-                self.finish(conn, LinuxOutcome::Rejected(LinuxRejector::Target))?;
-            }
-            TargetAcceptance::Unknown
-            | TargetAcceptance::Accepted(_)
-            | TargetAcceptance::Rejected(_) => {}
-        }
-        Ok(())
+        self.maybe_complete_release(conn)
     }
 
     fn send_drop<C: Connection>(
@@ -618,7 +606,7 @@ impl X11Session {
             [self.source_window, 0, self.last_event_time, 0, 0],
         )?;
         self.reporter.drop_performed();
-        if self.payload_served {
+        if self.payload_target == Some(target.logical) {
             self.mark_transfer_ready();
         }
         Ok(())
@@ -643,18 +631,7 @@ impl X11Session {
         } else {
             TargetAcceptance::Rejected(target)
         };
-        let released_target = self
-            .released_target
-            .filter(|released| released.logical == target);
-        if let (Some(released_target), None) = (released_target, self.drop_target) {
-            if accepted {
-                self.send_drop(conn, released_target)?;
-            } else {
-                self.leave_current_target(conn)?;
-                self.finish(conn, LinuxOutcome::Rejected(LinuxRejector::Target))?;
-            }
-        }
-        Ok(())
+        self.maybe_complete_release(conn)
     }
 
     fn handle_finished<C: Connection>(
@@ -705,7 +682,7 @@ impl X11Session {
             self.send_selection_notify(conn, event, property)?;
         } else if self.is_payload_target(event.target) {
             self.reporter.data_requested();
-            self.payload_served = true;
+            self.payload_target = self.current_target.map(|target| target.logical);
             let payload = if event.target == self.atoms.x_special_gnome_copied_files {
                 self.file_payload.gnome_copied_files()
             } else if event.target == self.atoms.text_plain_utf8
@@ -730,10 +707,34 @@ impl X11Session {
             self.send_selection_notify(conn, event, AtomEnum::NONE.into())?;
         }
         conn.flush().map_err(x11_error)?;
-        if self.drop_target.is_some() && self.payload_served {
+        if self
+            .drop_target
+            .is_some_and(|target| self.payload_target == Some(target.logical))
+        {
             self.mark_transfer_ready();
         }
         Ok(())
+    }
+
+    fn maybe_complete_release<C: Connection>(&mut self, conn: &C) -> Result<(), X11SessionError> {
+        let Some(target) = self.released_target else {
+            return Ok(());
+        };
+        if self.drop_target.is_some() {
+            return Ok(());
+        }
+        match self.target_acceptance {
+            TargetAcceptance::Rejected(logical) if logical == target.logical => {
+                self.leave_current_target(conn)?;
+                self.finish(conn, LinuxOutcome::Rejected(LinuxRejector::Target))
+            }
+            TargetAcceptance::Accepted(logical) if logical == target.logical => {
+                self.send_drop(conn, target)
+            }
+            TargetAcceptance::Unknown
+            | TargetAcceptance::Accepted(_)
+            | TargetAcceptance::Rejected(_) => Ok(()),
+        }
     }
 
     fn send_selection_notify<C: Connection>(
@@ -913,7 +914,6 @@ impl X11Session {
         root_x: i16,
         root_y: i16,
     ) -> Result<(), X11SessionError> {
-        self.target_acceptance = TargetAcceptance::Unknown;
         let xy = ((root_x as u32) << 16) | u32::from(root_y as u16);
         self.send_client_message(
             conn,
@@ -939,6 +939,7 @@ impl X11Session {
             )?;
         }
         self.target_acceptance = TargetAcceptance::Unknown;
+        self.payload_target = None;
         Ok(())
     }
 
