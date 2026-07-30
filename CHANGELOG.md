@@ -2,7 +2,7 @@
 
 ## 0.1.1 - Unreleased
 
-- Complete XWayland-to-Wayland bridge drops from accepted protocol and payload-transfer events without waiting indefinitely for a duplicate status or finish message.
+- Complete XWayland-to-Wayland bridge drops from accepted protocol and payload-transfer events while retaining selection ownership for additional target requests.
 - Coalesce repeated native progress notifications into one data-request and one drop-performed event per drag.
 - Free Windows transfer allocations when native memory locking fails.
 - Document native unsafe invariants and the public X11 event lifecycle.

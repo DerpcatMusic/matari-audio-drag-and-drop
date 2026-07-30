@@ -150,6 +150,7 @@ pub struct X11Session {
     released_target: Option<XdndTarget>,
     drop_target: Option<XdndTarget>,
     payload_served: bool,
+    transfer_complete: bool,
     last_event_time: u32,
     reporter: SessionReporter,
     finished: bool,
@@ -211,6 +212,7 @@ impl X11Session {
             released_target: None,
             drop_target: None,
             payload_served: false,
+            transfer_complete: false,
             last_event_time: press.time,
             reporter,
             finished: false,
@@ -253,6 +255,15 @@ impl X11Session {
         } else {
             X11SessionStatus::Active
         })
+    }
+
+    /// Whether protocol evidence already completed the user-visible transfer.
+    ///
+    /// The session remains alive after this point so targets may request
+    /// additional representations before sending `XdndFinished`.
+    #[must_use]
+    pub const fn transfer_complete(&self) -> bool {
+        self.transfer_complete
     }
 
     fn drive_event<C: Connection>(
@@ -365,7 +376,7 @@ impl X11Session {
         )?;
         self.reporter.drop_performed();
         if self.payload_served {
-            self.finish(conn, LinuxOutcome::Exported)?;
+            self.report_exported();
         }
         Ok(())
     }
@@ -473,7 +484,7 @@ impl X11Session {
         }
         conn.flush().map_err(x11_error)?;
         if self.drop_target.is_some() && self.payload_served {
-            self.finish(conn, LinuxOutcome::Exported)?;
+            self.report_exported();
         }
         Ok(())
     }
@@ -700,6 +711,11 @@ impl X11Session {
 
     fn is_payload_target(&self, target: Atom) -> bool {
         self.offered_targets().contains(&target)
+    }
+
+    fn report_exported(&mut self) {
+        self.transfer_complete = true;
+        self.reporter.finish_linux(LinuxOutcome::Exported);
     }
 
     fn finish<C: Connection>(
