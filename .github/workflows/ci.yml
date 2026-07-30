@@ -22,14 +22,19 @@ jobs:
       - name: Check formatting
         run: cargo fmt --check
 
-      - name: Test
-        run: cargo test --all-features
-
       - name: Check
-        run: cargo check --all-features
+        run: cargo check --locked
+
+      - name: Clippy
+        run: cargo clippy --locked --lib -- -D warnings
+
+      - name: Rustdoc
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --locked --no-deps
 
       - name: Package dry run
-        run: cargo publish --dry-run
+        run: cargo package --locked
 
   windows:
     name: Windows
@@ -42,7 +47,7 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Check Windows backend
-        run: cargo check --all-features
+        run: cargo clippy --locked --lib -- -D warnings
 
   macos:
     name: macOS
@@ -55,4 +60,4 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Check macOS backend
-        run: cargo check --all-features
+        run: cargo clippy --locked --lib -- -D warnings

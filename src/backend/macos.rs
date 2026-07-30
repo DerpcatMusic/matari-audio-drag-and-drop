@@ -1,32 +1,39 @@
 use std::path::PathBuf;
-use std::ptr;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
-use objc2::{define_class, msg_send, AnyThread, MainThreadMarker, MainThreadOnly};
+use objc2::{AnyThread, DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send};
 use objc2_app_kit::{
-    NSApplication, NSBitmapImageRep, NSDeviceRGBColorSpace, NSDragOperation, NSDraggingContext,
-    NSDraggingItem, NSDraggingSession, NSDraggingSource, NSEvent, NSImage, NSImageRep, NSView,
+    NSDragOperation, NSDraggingContext, NSDraggingItem, NSDraggingSession, NSDraggingSource,
+    NSEvent, NSView,
 };
 use objc2_foundation::{
     NSArray, NSObject, NSObjectProtocol, NSPoint, NSRect, NSSize, NSString, NSURL,
 };
 use raw_window_handle::RawWindowHandle;
 
-use super::{emit_backend_event, DragWindow, ExternalDragError};
-use crate::preview_render::{render_drag_chip, CHIP_HEIGHT, CHIP_WIDTH};
-use crate::{ExternalDragPayload, ExternalDragPreview};
+use super::ExternalDragPayload;
+use super::{DragWindow, ExternalDragError};
+use crate::{Outcome, SessionReporter};
+
+struct DragSourceIvars {
+    reporter: Mutex<Option<SessionReporter>>,
+    owns_self: AtomicBool,
+}
 
 define_class!(
     #[unsafe(super = NSObject)]
     #[thread_kind = MainThreadOnly]
-    #[name = "AudioPluginDndExternalDragSource"]
-    struct AudioPluginDndExternalDragSource;
+    #[name = "MatariExternalDragSource"]
+    #[ivars = DragSourceIvars]
+    struct MatariExternalDragSource;
 
-    unsafe impl NSObjectProtocol for AudioPluginDndExternalDragSource {}
+    unsafe impl NSObjectProtocol for MatariExternalDragSource {}
 
     #[allow(non_snake_case)]
-    unsafe impl NSDraggingSource for AudioPluginDndExternalDragSource {
+    unsafe impl NSDraggingSource for MatariExternalDragSource {
         #[unsafe(method(draggingSession:sourceOperationMaskForDraggingContext:))]
         fn draggingSession_sourceOperationMaskForDraggingContext(
             &self,
@@ -35,33 +42,65 @@ define_class!(
         ) -> NSDragOperation {
             NSDragOperation::Copy
         }
+
+        #[unsafe(method(draggingSession:endedAtPoint:operation:))]
+        fn draggingSession_endedAtPoint_operation(
+            &self,
+            _session: &NSDraggingSession,
+            _screen_point: NSPoint,
+            operation: NSDragOperation,
+        ) {
+            let reporter = self
+                .ivars()
+                .reporter
+                .lock()
+                .map(|mut reporter| reporter.take())
+                .unwrap_or(None);
+            if let Some(reporter) = reporter {
+                let outcome = if operation.contains(NSDragOperation::Copy) {
+                    Outcome::Copied
+                } else {
+                    Outcome::Cancelled
+                };
+                reporter.finish(outcome);
+            }
+            if self.ivars().owns_self.swap(false, Ordering::AcqRel) {
+                let pointer = std::ptr::from_ref(self).cast_mut();
+                // SAFETY: `start_drag_from_view` created exactly one retained
+                // self-ownership with `Retained::into_raw`; this terminal
+                // callback consumes that ownership exactly once.
+                let retained: Option<Retained<Self>> = unsafe { Retained::from_raw(pointer) };
+                drop(retained);
+            }
+        }
     }
 );
 
-impl AudioPluginDndExternalDragSource {
-    fn new(mtm: MainThreadMarker) -> Retained<Self> {
-        unsafe { msg_send![mtm.alloc::<Self>(), init] }
+impl MatariExternalDragSource {
+    fn new(mtm: MainThreadMarker, reporter: Option<SessionReporter>) -> Retained<Self> {
+        let this = mtm.alloc::<Self>().set_ivars(DragSourceIvars {
+            reporter: Mutex::new(reporter),
+            owns_self: AtomicBool::new(true),
+        });
+        unsafe { msg_send![super(this), init] }
     }
 }
 
 pub(super) fn start_external_file_drag(
-    window: DragWindow,
+    window: DragWindow<'_>,
     payload: ExternalDragPayload,
+    appkit_event: Option<std::ptr::NonNull<std::ffi::c_void>>,
+    reporter: Option<SessionReporter>,
 ) -> Result<(), ExternalDragError> {
-    let ExternalDragPayload { id, paths, preview } = payload;
+    let ExternalDragPayload { paths } = payload;
 
     if paths.is_empty() {
         return Err(ExternalDragError::EmptyPayload);
     }
-    let file_summary = validate_paths(&paths)?;
+    validate_paths(&paths)?;
 
-    let ns_view = match window.window() {
-        RawWindowHandle::AppKit(handle) if !handle.ns_view.is_null() => handle.ns_view.cast(),
-        RawWindowHandle::AppKit(_) => {
-            return Err(ExternalDragError::MissingWindowHandle(
-                "window does not have a valid AppKit NSView",
-            ));
-        }
+    let ns_view = match window.window().as_raw() {
+        RawWindowHandle::AppKit(handle) => handle.ns_view.as_ptr().cast(),
         other => {
             return Err(ExternalDragError::UnsupportedBackend {
                 backend: window.backend_kind(),
@@ -73,18 +112,14 @@ pub(super) fn start_external_file_drag(
     let mtm = MainThreadMarker::new().ok_or_else(|| {
         "macOS external file drag must start on the AppKit main thread".to_string()
     })?;
-    let app = NSApplication::sharedApplication(mtm);
-    let event = app.currentEvent().ok_or_else(|| {
-        "macOS external file drag needs the AppKit mouse event that started the drag".to_string()
-    })?;
+    let event = appkit_event
+        .map(|event| unsafe { &*event.cast::<NSEvent>().as_ptr() })
+        .ok_or_else(|| {
+            "macOS external file drag needs the exact initiating AppKit NSEvent".to_string()
+        })?;
 
     let view = unsafe { &*ns_view };
-    emit_backend_event(format!(
-        "[dnd#{id}] macOS AppKit drag preparing {} file(s): {}",
-        paths.len(),
-        file_summary.join(", ")
-    ));
-    start_drag_from_view(view, &event, &paths, preview.as_ref());
+    start_drag_from_view(view, event, &paths, reporter, mtm);
     Ok(())
 }
 
@@ -92,28 +127,23 @@ fn start_drag_from_view(
     view: &NSView,
     event: &NSEvent,
     paths: &[PathBuf],
-    preview: Option<&ExternalDragPreview>,
+    reporter: Option<SessionReporter>,
+    mtm: MainThreadMarker,
 ) {
     let location = event.locationInWindow();
-    let chip = preview.map(ns_image_from_preview);
-    let items = dragging_items(paths, location, chip.as_ref());
+    let items = dragging_items(paths, location);
     let item_refs = items.iter().map(|item| &**item).collect::<Vec<_>>();
     let item_array = NSArray::from_slice(&item_refs);
-    let mtm = MainThreadMarker::new().expect("AppKit drag source should still be on main thread");
-    let source = AudioPluginDndExternalDragSource::new(mtm);
+    let source = MatariExternalDragSource::new(mtm, reporter);
     let source_ref: &ProtocolObject<dyn NSDraggingSource> = ProtocolObject::from_ref(&*source);
 
     let _session = view.beginDraggingSessionWithItems_event_source(&item_array, event, source_ref);
-    let _ = Retained::into_raw(source);
+    let _self_owned_until_terminal = Retained::into_raw(source);
 }
 
-fn dragging_items(
-    paths: &[PathBuf],
-    location: NSPoint,
-    chip: Option<&Retained<NSImage>>,
-) -> Vec<Retained<NSDraggingItem>> {
-    let width = CHIP_WIDTH as f64;
-    let height = CHIP_HEIGHT as f64;
+fn dragging_items(paths: &[PathBuf], location: NSPoint) -> Vec<Retained<NSDraggingItem>> {
+    let width = 1.0;
+    let height = 1.0;
     paths
         .iter()
         .enumerate()
@@ -127,10 +157,6 @@ fn dragging_items(
                 NSDraggingItem::initWithPasteboardWriter(NSDraggingItem::alloc(), writer);
             let offset = index as f64 * 4.0;
             unsafe {
-                let contents = chip.map(|image| {
-                    let image: &NSImage = image;
-                    image as &objc2::runtime::AnyObject
-                });
                 dragging_item.setDraggingFrame_contents(
                     NSRect::new(
                         NSPoint::new(
@@ -139,7 +165,7 @@ fn dragging_items(
                         ),
                         NSSize::new(width, height),
                     ),
-                    contents,
+                    None,
                 );
             }
             dragging_item
@@ -147,40 +173,7 @@ fn dragging_items(
         .collect()
 }
 
-fn ns_image_from_preview(preview: &ExternalDragPreview) -> Retained<NSImage> {
-    let image = render_drag_chip(preview);
-    let size = NSSize::new(image.width as f64, image.height as f64);
-    let ns_image = NSImage::initWithSize(NSImage::alloc(), size);
-    let Some(bitmap) = (unsafe {
-        NSBitmapImageRep::initWithBitmapDataPlanes_pixelsWide_pixelsHigh_bitsPerSample_samplesPerPixel_hasAlpha_isPlanar_colorSpaceName_bytesPerRow_bitsPerPixel(
-            NSBitmapImageRep::alloc(),
-            ptr::null_mut(),
-            image.width as isize,
-            image.height as isize,
-            8,
-            4,
-            true,
-            false,
-            NSDeviceRGBColorSpace,
-            (image.width * 4) as isize,
-            32,
-        )
-    }) else {
-        return ns_image;
-    };
-    let pixels = bitmap.bitmapData();
-    if !pixels.is_null() {
-        unsafe {
-            ptr::copy_nonoverlapping(image.rgba.as_ptr(), pixels, image.rgba.len());
-        }
-    }
-    let rep: &NSImageRep = bitmap.as_ref();
-    ns_image.addRepresentation(rep);
-    ns_image
-}
-
-fn validate_paths(paths: &[PathBuf]) -> Result<Vec<String>, String> {
-    let mut summary = Vec::with_capacity(paths.len());
+fn validate_paths(paths: &[PathBuf]) -> Result<(), String> {
     for path in paths {
         let metadata = std::fs::metadata(path)
             .map_err(|err| format!("drag file is not readable: {}: {err}", path.display()))?;
@@ -190,7 +183,6 @@ fn validate_paths(paths: &[PathBuf]) -> Result<Vec<String>, String> {
         if metadata.len() == 0 {
             return Err(format!("drag file is empty: {}", path.display()));
         }
-        summary.push(format!("{} ({} bytes)", path.display(), metadata.len()));
     }
-    Ok(summary)
+    Ok(())
 }

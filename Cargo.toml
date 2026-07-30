@@ -1,39 +1,31 @@
 [package]
-name = "audio-plugin-dnd"
-version = "0.1.25"
-edition = "2021"
-rust-version = "1.75"
-description = "Drag-and-drop protocol helpers for Rust audio plugin GUIs"
-license = "ISC"
+name = "matari-audio-drag-and-drop"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+description = "Typed cross-platform drag-and-drop for Rust audio plugin GUIs"
+license = "MIT OR Apache-2.0"
 readme = "README.md"
-repository = "https://github.com/DerpcatMusic/audio-plugin-dnd"
-documentation = "https://docs.rs/audio-plugin-dnd"
+repository = "https://github.com/DerpcatMusic/matari-audio-drag-and-drop"
+documentation = "https://docs.rs/matari-audio-drag-and-drop"
 keywords = ["audio", "plugins", "dnd", "wayland", "gui"]
 categories = ["gui", "os::linux-apis"]
 include = [
     "CHANGELOG.md",
     "Cargo.toml",
     "LICENSE",
+    "LICENSE-APACHE",
+    "LICENSE-MIT",
     "README.md",
     "src/**/*.rs",
 ]
 
-[features]
-default = []
-nice-log = []
-tracing = []
-
 [dependencies]
 percent-encoding = "2.3"
-raw-window-handle = "0.5"
+raw-window-handle = "0.6"
 
 [target.'cfg(all(target_family = "unix", not(target_os = "macos")))'.dependencies]
-serde_json = "1.0"
-smithay-client-toolkit = { version = "0.20.0", default-features = false, features = ["calloop"] }
-wayland-client = { version = "0.31.14", features = ["system"] }
-wayland-sys = { version = "0.31.11", features = ["client", "dlopen", "libwayland_client_1_23"] }
-x11rb = { version = "0.13", features = ["randr"] }
-zbus = { version = "5.12", default-features = false, features = ["async-io", "blocking-api"] }
+x11rb = "0.13"
 
 [target.'cfg(target_os = "windows")'.dependencies]
 windows-core = "=0.62.2"
@@ -61,14 +53,10 @@ version = "0.3"
 default-features = false
 features = [
     "NSApplication",
-    "NSBitmapImageRep",
     "NSDragging",
     "NSDraggingItem",
     "NSDraggingSession",
     "NSEvent",
-    "NSGraphics",
-    "NSImage",
-    "NSImageRep",
     "NSPasteboard",
     "NSPasteboardItem",
     "NSResponder",

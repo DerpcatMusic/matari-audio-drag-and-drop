@@ -1,7 +1,5 @@
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(super) struct MimeTargets {
-    pub(super) portal_filetransfer: u32,
-    pub(super) portal_files: u32,
     pub(super) text_uri_list: u32,
     pub(super) text_uri_list_utf8: u32,
     pub(super) text_x_uri: u32,
@@ -14,13 +12,8 @@ pub(super) struct MimeTargets {
 }
 
 impl MimeTargets {
-    pub(super) fn offered_targets(&self, portal_available: bool) -> Vec<u32> {
-        let mut targets = Vec::with_capacity(11);
-
-        if portal_available {
-            self.push_unique(&mut targets, self.portal_filetransfer);
-            self.push_unique(&mut targets, self.portal_files);
-        }
+    pub(super) fn offered_targets(&self) -> Vec<u32> {
+        let mut targets = Vec::with_capacity(9);
 
         self.push_unique(&mut targets, self.text_uri_list);
         self.push_unique(&mut targets, self.text_uri_list_utf8);
@@ -61,14 +54,9 @@ impl MimeTargets {
         selected
     }
 
-    pub(super) fn is_portal_target(&self, target: u32) -> bool {
-        target != 0 && (target == self.portal_filetransfer || target == self.portal_files)
-    }
-
     pub(super) fn is_file_payload_target(&self, target: u32) -> bool {
         target != 0
-            && (self.is_portal_target(target)
-                || target == self.text_uri_list
+            && (target == self.text_uri_list
                 || target == self.text_uri_list_utf8
                 || target == self.text_x_uri
                 || target == self.kde_uri_list
