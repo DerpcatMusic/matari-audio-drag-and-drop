@@ -6,7 +6,7 @@ use std::ptr;
 use raw_window_handle::RawWindowHandle;
 use windows::Win32::Foundation::{
     DRAGDROP_S_CANCEL, DRAGDROP_S_DROP, DRAGDROP_S_USEDEFAULTCURSORS, DV_E_FORMATETC, E_NOTIMPL,
-    HWND, OLE_E_ADVISENOTSUPPORTED, POINT, RPC_E_CHANGED_MODE,
+    GlobalFree, HGLOBAL, HWND, OLE_E_ADVISENOTSUPPORTED, POINT, RPC_E_CHANGED_MODE,
 };
 use windows::Win32::System::Com::{
     DATADIR_GET, DVASPECT_CONTENT, FORMATETC, IAdviseSink, IDataObject, IDataObject_Impl,
@@ -55,6 +55,8 @@ pub(super) fn start_external_file_drag(
     let data_object: IDataObject = FileDataObject::new(paths)?.into();
     let drop_source: IDropSource = FileDropSource.into();
     let mut effect = DROPEFFECT(0);
+    // SAFETY: OLE is initialized on this GUI thread, both COM interfaces remain
+    // alive for the call, and `effect` is a writable `DROPEFFECT`.
     unsafe {
         let result = DoDragDrop(
             &data_object,
@@ -88,6 +90,8 @@ struct OleDragApartment;
 
 impl OleDragApartment {
     fn initialize() -> std::result::Result<Self, String> {
+        // SAFETY: This initializes OLE for the current GUI thread. Successful
+        // initialization is paired with `OleUninitialize` in `Drop`.
         match unsafe { OleInitialize(None) } {
             Ok(()) => Ok(Self),
             Err(err) if err.code() == RPC_E_CHANGED_MODE => {
@@ -100,6 +104,8 @@ impl OleDragApartment {
 
 impl Drop for OleDragApartment {
     fn drop(&mut self) {
+        // SAFETY: `OleDragApartment` is created only after `OleInitialize`
+        // succeeds and remains on the synchronous drag's GUI thread.
         unsafe { OleUninitialize() };
     }
 }
@@ -142,7 +148,15 @@ impl FileDataObject {
         }
     }
 
+    /// Match a format supplied by an `IDataObject` COM call.
+    ///
+    /// # Safety
+    ///
+    /// `pformatetc` must be null or point to a readable `FORMATETC` for the
+    /// duration of this call.
     unsafe fn requested_format(&self, pformatetc: *const FORMATETC) -> Option<ShellDragFormat> {
+        // SAFETY: The caller upholds the pointer contract documented above;
+        // `as_ref` additionally handles a null pointer.
         let format = unsafe { pformatetc.as_ref() }?;
 
         if format.dwAspect != DVASPECT_CONTENT.0
@@ -159,40 +173,27 @@ impl FileDataObject {
     }
 
     fn hdrop_medium(&self) -> Result<STGMEDIUM> {
-        let hglobal = build_hdrop(&self.paths)?;
-        Ok(STGMEDIUM {
-            tymed: TYMED_HGLOBAL.0 as u32,
-            u: STGMEDIUM_0 { hGlobal: hglobal },
-            pUnkForRelease: ManuallyDrop::new(None::<IUnknown>),
-        })
+        Ok(build_hdrop(&self.paths)?.into_medium())
     }
 
     fn preferred_drop_effect_medium(&self) -> Result<STGMEDIUM> {
-        let hglobal = build_u32_hglobal(DROPEFFECT_COPY.0)?;
-        Ok(STGMEDIUM {
-            tymed: TYMED_HGLOBAL.0 as u32,
-            u: STGMEDIUM_0 { hGlobal: hglobal },
-            pUnkForRelease: ManuallyDrop::new(None::<IUnknown>),
-        })
+        Ok(build_u32_hglobal(DROPEFFECT_COPY.0)?.into_medium())
     }
 
     fn filenamew_medium(&self) -> Result<STGMEDIUM> {
         let Some(path) = self.paths.first() else {
             return Err(DV_E_FORMATETC.into());
         };
-        let hglobal =
-            build_wide_string_hglobal(&path.as_os_str().encode_wide().collect::<Vec<_>>())?;
-        Ok(STGMEDIUM {
-            tymed: TYMED_HGLOBAL.0 as u32,
-            u: STGMEDIUM_0 { hGlobal: hglobal },
-            pUnkForRelease: ManuallyDrop::new(None::<IUnknown>),
-        })
+        let wide = path.as_os_str().encode_wide().collect::<Vec<_>>();
+        Ok(build_wide_string_hglobal(&wide)?.into_medium())
     }
 }
 
 #[allow(non_snake_case)]
 impl IDataObject_Impl for FileDataObject_Impl {
     fn GetData(&self, pformatetcin: *const FORMATETC) -> Result<STGMEDIUM> {
+        // SAFETY: COM requires `pformatetcin` to be null or a readable
+        // `FORMATETC` for the duration of `GetData`.
         match unsafe { self.requested_format(pformatetcin) } {
             Some(ShellDragFormat::Hdrop) => self.hdrop_medium(),
             Some(ShellDragFormat::PreferredDropEffect(_)) => self.preferred_drop_effect_medium(),
@@ -206,6 +207,8 @@ impl IDataObject_Impl for FileDataObject_Impl {
     }
 
     fn QueryGetData(&self, pformatetc: *const FORMATETC) -> HRESULT {
+        // SAFETY: COM requires `pformatetc` to be null or a readable
+        // `FORMATETC` for the duration of `QueryGetData`.
         if unsafe { self.requested_format(pformatetc) }.is_some() {
             HRESULT(0)
         } else {
@@ -238,6 +241,8 @@ impl IDataObject_Impl for FileDataObject_Impl {
                 .into_iter()
                 .map(|format| FileDataObject::format(format.clipboard_format()))
                 .collect::<Vec<_>>();
+            // SAFETY: `formats` is initialized and valid for the call;
+            // `SHCreateStdEnumFmtEtc` copies the entries into the enumerator.
             unsafe { SHCreateStdEnumFmtEtc(&formats) }
         } else {
             Err(E_NOTIMPL.into())
@@ -310,6 +315,8 @@ impl ShellDragFormat {
 }
 
 fn registered_clipboard_format(name: PCWSTR) -> Option<u16> {
+    // SAFETY: The caller supplies one of the static, nul-terminated
+    // `CFSTR_*` strings exported by the Windows bindings.
     let value = unsafe { RegisterClipboardFormatW(name) };
     u16::try_from(value).ok().filter(|value| *value != 0)
 }
@@ -334,7 +341,49 @@ impl IDropSource_Impl for FileDropSource_Impl {
     }
 }
 
-fn build_hdrop(paths: &[PathBuf]) -> Result<windows::Win32::Foundation::HGLOBAL> {
+struct OwnedHGlobal(HGLOBAL);
+
+impl OwnedHGlobal {
+    fn allocate(bytes: usize) -> Result<Self> {
+        // SAFETY: `GHND` requests a movable, zero-initialized allocation and
+        // `bytes` is the exact size subsequently written by the builder.
+        unsafe { GlobalAlloc(GHND, bytes).map(Self) }
+    }
+
+    fn lock(&self) -> Result<ptr::NonNull<u8>> {
+        // SAFETY: `self.0` is a live allocation exclusively owned by this
+        // value. It remains alive until the matching `unlock`.
+        let data = unsafe { GlobalLock(self.0) }.cast::<u8>();
+        ptr::NonNull::new(data).ok_or_else(windows_core::Error::from_thread)
+    }
+
+    fn unlock(&self) {
+        // SAFETY: Each builder calls this exactly once after a successful
+        // `lock`, before the handle is freed or transferred.
+        let _ = unsafe { GlobalUnlock(self.0) };
+    }
+
+    fn into_medium(self) -> STGMEDIUM {
+        let hglobal = self.0;
+        std::mem::forget(self);
+        STGMEDIUM {
+            tymed: TYMED_HGLOBAL.0 as u32,
+            u: STGMEDIUM_0 { hGlobal: hglobal },
+            pUnkForRelease: ManuallyDrop::new(None::<IUnknown>),
+        }
+    }
+}
+
+impl Drop for OwnedHGlobal {
+    fn drop(&mut self) {
+        // SAFETY: While this owner exists, it holds the only responsibility
+        // for a live, unlocked `HGLOBAL`. `into_medium` forgets the owner when
+        // COM assumes that responsibility through `STGMEDIUM`.
+        let _ = unsafe { GlobalFree(Some(self.0)) };
+    }
+}
+
+fn build_hdrop(paths: &[PathBuf]) -> Result<OwnedHGlobal> {
     let mut encoded_paths = Vec::with_capacity(paths.len());
     let mut wide_len = 1usize;
 
@@ -347,13 +396,12 @@ fn build_hdrop(paths: &[PathBuf]) -> Result<windows::Win32::Foundation::HGLOBAL>
 
     let header_size = size_of::<DROPFILES>();
     let bytes = header_size + wide_len * size_of::<u16>();
-    let hglobal = unsafe { GlobalAlloc(GHND, bytes)? };
-    let data = unsafe { GlobalLock(hglobal) } as *mut u8;
+    let hglobal = OwnedHGlobal::allocate(bytes)?;
+    let data = hglobal.lock()?.as_ptr();
 
-    if data.is_null() {
-        return Err(windows_core::Error::from_thread());
-    }
-
+    // SAFETY: `data` points to the `bytes`-sized allocation above. The header,
+    // each encoded path, and the final terminator exactly fill that allocation
+    // without overlap.
     unsafe {
         (data as *mut DROPFILES).write(DROPFILES {
             pFiles: header_size as u32,
@@ -368,41 +416,37 @@ fn build_hdrop(paths: &[PathBuf]) -> Result<windows::Win32::Foundation::HGLOBAL>
             cursor = cursor.add(encoded.len());
         }
         cursor.write(0);
-
-        let _ = GlobalUnlock(hglobal);
     }
+    hglobal.unlock();
 
     Ok(hglobal)
 }
 
-fn build_u32_hglobal(value: u32) -> Result<windows::Win32::Foundation::HGLOBAL> {
-    let hglobal = unsafe { GlobalAlloc(GHND, size_of::<u32>())? };
-    let data = unsafe { GlobalLock(hglobal) } as *mut u32;
-    if data.is_null() {
-        return Err(windows_core::Error::from_thread());
-    }
+fn build_u32_hglobal(value: u32) -> Result<OwnedHGlobal> {
+    let hglobal = OwnedHGlobal::allocate(size_of::<u32>())?;
+    let data = hglobal.lock()?.cast::<u32>().as_ptr();
 
+    // SAFETY: `data` points to an aligned allocation of exactly one `u32`.
     unsafe {
         data.write(value);
-        let _ = GlobalUnlock(hglobal);
     }
+    hglobal.unlock();
 
     Ok(hglobal)
 }
 
-fn build_wide_string_hglobal(wide: &[u16]) -> Result<windows::Win32::Foundation::HGLOBAL> {
+fn build_wide_string_hglobal(wide: &[u16]) -> Result<OwnedHGlobal> {
     let bytes = (wide.len() + 1) * size_of::<u16>();
-    let hglobal = unsafe { GlobalAlloc(GHND, bytes)? };
-    let data = unsafe { GlobalLock(hglobal) } as *mut u16;
-    if data.is_null() {
-        return Err(windows_core::Error::from_thread());
-    }
+    let hglobal = OwnedHGlobal::allocate(bytes)?;
+    let data = hglobal.lock()?.cast::<u16>().as_ptr();
 
+    // SAFETY: `data` points to `wide.len() + 1` writable `u16` elements. The
+    // source is disjoint, and the final element is reserved for the terminator.
     unsafe {
         ptr::copy_nonoverlapping(wide.as_ptr(), data, wide.len());
         data.add(wide.len()).write(0);
-        let _ = GlobalUnlock(hglobal);
     }
+    hglobal.unlock();
 
     Ok(hglobal)
 }

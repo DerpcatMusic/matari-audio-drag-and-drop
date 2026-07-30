@@ -1,6 +1,6 @@
 [package]
 name = "matari-audio-drag-and-drop"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 rust-version = "1.95"
 description = "Typed cross-platform drag-and-drop for Rust audio plugin GUIs"
@@ -8,16 +8,27 @@ license = "MIT OR Apache-2.0"
 readme = "README.md"
 repository = "https://github.com/DerpcatMusic/matari-audio-drag-and-drop"
 documentation = "https://docs.rs/matari-audio-drag-and-drop"
+publish = ["crates-io"]
 keywords = ["audio", "plugins", "dnd", "wayland", "gui"]
 categories = ["gui", "os::linux-apis"]
 include = [
     "CHANGELOG.md",
+    "CONTRIBUTING.md",
     "Cargo.toml",
     "LICENSE",
     "LICENSE-APACHE",
     "LICENSE-MIT",
     "README.md",
+    "SECURITY.md",
     "src/**/*.rs",
+]
+
+[package.metadata.docs.rs]
+all-features = true
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "x86_64-pc-windows-msvc",
+    "aarch64-apple-darwin",
 ]
 
 [dependencies]

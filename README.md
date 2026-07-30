@@ -38,6 +38,14 @@ from elapsed time.
 Linux reporters distinguish successful export, target/compositor rejection,
 unsupported routes, and setup failure.
 
+## Maturity
+
+Matari 0.1 is experimental. Windows OLE, macOS AppKit, X11/XWayland XDND, and
+native Wayland data-device integrations compile on their native targets, but
+compilation is not host qualification. Treat a route as supported only after a
+dated run records the operating system, host and format, window presentation,
+source and target backends, payload, and exact terminal outcome.
+
 ## Realtime safety
 
 Matari is a GUI/background facility. Do not validate files, start a native
@@ -49,7 +57,11 @@ drag, access the OS, or drain controller events from an audio callback.
 cargo fmt --check
 cargo check --locked
 cargo clippy --locked --lib
+cargo publish --dry-run --locked
 ```
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for protocol invariants and
+[SECURITY.md](SECURITY.md) for private vulnerability reporting.
 
 ## License
 

@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.1.1 - Unreleased
+
+- Free Windows transfer allocations when native memory locking fails.
+- Document native unsafe invariants and the public X11 event lifecycle.
+- Enforce the declared Rust 1.95 MSRV, dependency policy, strict native unsafe
+  lints, complete public documentation, and registry publication dry runs.
+- Mark every native backend experimental until dated host evidence qualifies it.
+
 ## 0.1.0 - 2026-07-30
 
 - Introduced Matari's editor-owned, typed drag-and-drop API with event-driven native lifecycle reporting.

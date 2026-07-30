@@ -24,15 +24,21 @@ struct DragSourceIvars {
 }
 
 define_class!(
+    // SAFETY: The class has an `NSObject` superclass, uses ivars initialized by
+    // `set_ivars`, and is confined to AppKit's main thread.
     #[unsafe(super = NSObject)]
     #[thread_kind = MainThreadOnly]
     #[name = "MatariExternalDragSource"]
     #[ivars = DragSourceIvars]
     struct MatariExternalDragSource;
 
+    // SAFETY: `define_class!` registers this type as an `NSObject` subclass,
+    // so every instance satisfies `NSObjectProtocol`.
     unsafe impl NSObjectProtocol for MatariExternalDragSource {}
 
     #[allow(non_snake_case)]
+    // SAFETY: Both methods use the exact selectors and signatures required by
+    // `NSDraggingSource`; `MainThreadOnly` enforces AppKit thread affinity.
     unsafe impl NSDraggingSource for MatariExternalDragSource {
         #[unsafe(method(draggingSession:sourceOperationMaskForDraggingContext:))]
         fn draggingSession_sourceOperationMaskForDraggingContext(
@@ -82,6 +88,9 @@ impl MatariExternalDragSource {
             reporter: Mutex::new(reporter),
             owns_self: AtomicBool::new(true),
         });
+        // SAFETY: `this` is a newly allocated instance whose ivars were
+        // initialized above; invoking the `NSObject` superclass initializer is
+        // the required final construction step.
         unsafe { msg_send![super(this), init] }
     }
 }
@@ -113,11 +122,16 @@ pub(super) fn start_external_file_drag(
         "macOS external file drag must start on the AppKit main thread".to_string()
     })?;
     let event = appkit_event
+        // SAFETY: `DragOrigin::with_appkit_event` requires this to be a live
+        // `NSEvent` from the same main-thread gesture; `mtm` proves this call
+        // is executing on that main thread.
         .map(|event| unsafe { &*event.cast::<NSEvent>().as_ptr() })
         .ok_or_else(|| {
             "macOS external file drag needs the exact initiating AppKit NSEvent".to_string()
         })?;
 
+    // SAFETY: `RawWindowHandle::AppKit` guarantees `ns_view` identifies the
+    // live `NSView` borrowed through `window`; `mtm` proves main-thread access.
     let view = unsafe { &*ns_view };
     start_drag_from_view(view, event, &paths, reporter, mtm);
     Ok(())
@@ -156,6 +170,9 @@ fn dragging_items(paths: &[PathBuf], location: NSPoint) -> Vec<Retained<NSDraggi
             let dragging_item =
                 NSDraggingItem::initWithPasteboardWriter(NSDraggingItem::alloc(), writer);
             let offset = index as f64 * 4.0;
+            // SAFETY: `dragging_item` is fully initialized, the finite frame is
+            // valid for the duration of the call, and AppKit permits no custom
+            // contents image.
             unsafe {
                 dragging_item.setDraggingFrame_contents(
                     NSRect::new(

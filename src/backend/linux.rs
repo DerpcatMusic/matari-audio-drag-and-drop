@@ -23,16 +23,22 @@ const STATUS_ACCEPT: u32 = 1;
 /// Authoritative pointer state from the X11 event that initiated a drag.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct X11PointerEvent {
+    /// Root window containing the pointer.
     pub root: XWindow,
+    /// Pointer position along the root window's horizontal axis.
     pub root_x: i16,
+    /// Pointer position along the root window's vertical axis.
     pub root_y: i16,
+    /// Server timestamp from the initiating pointer event.
     pub time: u32,
 }
 
 /// Whether an event-scoped X11 drag still owns a live session.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum X11SessionStatus {
+    /// The session still owns an active native drag.
     Active,
+    /// The session reached a terminal native event.
     Finished,
 }
 
@@ -363,13 +369,12 @@ impl X11Session {
         }
         let accepted = data[1] & STATUS_ACCEPT == STATUS_ACCEPT;
         self.accepted_target = accepted.then_some(target);
-        if self
+        let released_target = self
             .released_target
-            .is_some_and(|released| released.logical == target)
-            && self.drop_target.is_none()
-        {
+            .filter(|released| released.logical == target);
+        if let (Some(released_target), None) = (released_target, self.drop_target) {
             if accepted {
-                self.send_drop(conn, self.released_target.expect("checked above"))?;
+                self.send_drop(conn, released_target)?;
             } else {
                 self.leave_current_target(conn)?;
                 self.finish(conn, LinuxOutcome::Rejected(LinuxRejector::Target))?;
