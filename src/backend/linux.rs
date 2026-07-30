@@ -74,6 +74,13 @@ struct XdndTarget {
     recipient: XWindow,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TargetAcceptance {
+    Unknown,
+    Accepted(XWindow),
+    Rejected(XWindow),
+}
+
 struct XdndAtoms {
     xdnd_selection: Atom,
     xdnd_enter: Atom,
@@ -252,7 +259,7 @@ pub struct X11Session {
     source_window: XWindow,
     file_payload: FileDragPayloadData,
     current_target: Option<XdndTarget>,
-    accepted_target: Option<XWindow>,
+    target_acceptance: TargetAcceptance,
     released_target: Option<XdndTarget>,
     drop_target: Option<XdndTarget>,
     payload_served: bool,
@@ -319,7 +326,7 @@ impl X11Session {
             source_window,
             file_payload: FileDragPayloadData::from_validated(paths),
             current_target: None,
-            accepted_target: None,
+            target_acceptance: TargetAcceptance::Unknown,
             released_target: None,
             drop_target: None,
             payload_served: false,
@@ -527,8 +534,17 @@ impl X11Session {
             return self.finish(conn, LinuxOutcome::Cancelled);
         };
         self.released_target = Some(target);
-        if self.accepted_target == Some(target.logical) {
-            self.send_drop(conn, target)?;
+        match self.target_acceptance {
+            TargetAcceptance::Accepted(logical) if logical == target.logical => {
+                self.send_drop(conn, target)?;
+            }
+            TargetAcceptance::Rejected(logical) if logical == target.logical => {
+                self.leave_current_target(conn)?;
+                self.finish(conn, LinuxOutcome::Rejected(LinuxRejector::Target))?;
+            }
+            TargetAcceptance::Unknown
+            | TargetAcceptance::Accepted(_)
+            | TargetAcceptance::Rejected(_) => {}
         }
         Ok(())
     }
@@ -566,7 +582,11 @@ impl X11Session {
             return Ok(());
         }
         let accepted = data[1] & STATUS_ACCEPT == STATUS_ACCEPT;
-        self.accepted_target = accepted.then_some(target);
+        self.target_acceptance = if accepted {
+            TargetAcceptance::Accepted(target)
+        } else {
+            TargetAcceptance::Rejected(target)
+        };
         let released_target = self
             .released_target
             .filter(|released| released.logical == target);
@@ -837,7 +857,7 @@ impl X11Session {
         root_x: i16,
         root_y: i16,
     ) -> Result<(), X11SessionError> {
-        self.accepted_target = None;
+        self.target_acceptance = TargetAcceptance::Unknown;
         let xy = ((root_x as u32) << 16) | u32::from(root_y as u16);
         self.send_client_message(
             conn,
@@ -862,7 +882,7 @@ impl X11Session {
                 [self.source_window, 0, 0, 0, 0],
             )?;
         }
-        self.accepted_target = None;
+        self.target_acceptance = TargetAcceptance::Unknown;
         Ok(())
     }
 
