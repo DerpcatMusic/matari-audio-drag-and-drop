@@ -1243,6 +1243,8 @@ pub struct Controller {
 #[derive(Clone, Copy)]
 struct ActiveOutbound {
     session: SessionId<Outbound>,
+    data_requested: bool,
+    drop_performed: bool,
 }
 
 impl Controller {
@@ -1295,7 +1297,11 @@ impl Controller {
                 events: self.events.clone(),
             }),
         };
-        self.active_outbound = Some(ActiveOutbound { session });
+        self.active_outbound = Some(ActiveOutbound {
+            session,
+            data_requested: false,
+            drop_performed: false,
+        });
 
         match adapter.schedule_outbound(ticket) {
             Ok(()) => Ok(session),
@@ -1354,19 +1360,28 @@ impl Controller {
                 self.pending
                     .push(SessionEvent::OutboundStarted { session, route });
             }
-            TicketEvent::DataRequested(session) if self.is_live(session) => {
-                self.pending.push(SessionEvent::DataRequested { session });
+            TicketEvent::DataRequested(session) => {
+                if let Some(active) = &mut self.active_outbound
+                    && active.session == session
+                    && !active.data_requested
+                {
+                    active.data_requested = true;
+                    self.pending.push(SessionEvent::DataRequested { session });
+                }
             }
-            TicketEvent::DropPerformed(session) if self.is_live(session) => {
-                self.pending.push(SessionEvent::DropPerformed { session });
+            TicketEvent::DropPerformed(session) => {
+                if let Some(active) = &mut self.active_outbound
+                    && active.session == session
+                    && !active.drop_performed
+                {
+                    active.drop_performed = true;
+                    self.pending.push(SessionEvent::DropPerformed { session });
+                }
             }
             TicketEvent::Terminal { session, outcome } if self.is_live(session) => {
                 self.finish_outbound(session, outcome);
             }
-            TicketEvent::Started { .. }
-            | TicketEvent::DataRequested(_)
-            | TicketEvent::DropPerformed(_)
-            | TicketEvent::Terminal { .. } => {}
+            TicketEvent::Started { .. } | TicketEvent::Terminal { .. } => {}
         }
     }
 
