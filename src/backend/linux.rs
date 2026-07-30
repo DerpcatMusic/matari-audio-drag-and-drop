@@ -13,8 +13,8 @@ use x11rb::connection::Connection;
 use x11rb::protocol::Event;
 use x11rb::protocol::xproto::{
     Atom, AtomEnum, ButtonReleaseEvent, ClientMessageEvent, ConfigureWindowAux, ConnectionExt,
-    CreateGCAux, CreateWindowAux, EventMask, Gcontext, ImageFormat, PropMode, SelectionNotifyEvent,
-    SelectionRequestEvent, StackMode, Window as XWindow, WindowClass,
+    CreateGCAux, CreateWindowAux, EventMask, Gcontext, GrabMode, GrabStatus, ImageFormat, PropMode,
+    SelectionNotifyEvent, SelectionRequestEvent, StackMode, Window as XWindow, WindowClass,
 };
 use x11rb::wrapper::ConnectionExt as _;
 
@@ -264,6 +264,7 @@ pub struct X11Session {
     drop_target: Option<XdndTarget>,
     payload_served: bool,
     transfer_complete: bool,
+    pointer_grabbed: bool,
     preview: Option<PreviewWindow>,
     last_event_time: u32,
     reporter: SessionReporter,
@@ -307,14 +308,48 @@ impl X11Session {
         let atoms = XdndAtoms::new(conn)?;
         conn.set_selection_owner(source_window, atoms.xdnd_selection, press.time)
             .map_err(x11_error)?;
-        let owner = conn
+        let owner = match conn
             .get_selection_owner(atoms.xdnd_selection)
-            .map_err(x11_error)?
-            .reply()
-            .map_err(x11_error)?
-            .owner;
+            .map_err(x11_error)
+            .and_then(|cookie| cookie.reply().map_err(x11_error))
+        {
+            Ok(reply) => reply.owner,
+            Err(error) => {
+                let _ = conn.set_selection_owner(x11rb::NONE, atoms.xdnd_selection, press.time);
+                let _ = conn.flush();
+                return Err(error);
+            }
+        };
         if owner != source_window {
             return Err(X11SessionError::new("could not own XdndSelection"));
+        }
+        let grab_status = match conn
+            .grab_pointer(
+                true,
+                source_window,
+                EventMask::POINTER_MOTION | EventMask::BUTTON_RELEASE,
+                GrabMode::ASYNC,
+                GrabMode::ASYNC,
+                x11rb::NONE,
+                x11rb::NONE,
+                press.time,
+            )
+            .map_err(x11_error)
+            .and_then(|cookie| cookie.reply().map_err(x11_error))
+        {
+            Ok(reply) => reply.status,
+            Err(error) => {
+                let _ = conn.set_selection_owner(x11rb::NONE, atoms.xdnd_selection, press.time);
+                let _ = conn.flush();
+                return Err(error);
+            }
+        };
+        if grab_status != GrabStatus::SUCCESS {
+            let _ = conn.set_selection_owner(x11rb::NONE, atoms.xdnd_selection, press.time);
+            let _ = conn.flush();
+            return Err(X11SessionError::new(format!(
+                "could not capture the drag pointer: {grab_status:?}"
+            )));
         }
 
         let preview = preview.and_then(|preview| {
@@ -331,12 +366,14 @@ impl X11Session {
             drop_target: None,
             payload_served: false,
             transfer_complete: false,
+            pointer_grabbed: true,
             preview,
             last_event_time: press.time,
             reporter,
             finished: false,
         };
         if let Err(error) = session.update_target(conn, press.root_x, press.root_y) {
+            session.release_pointer(conn);
             if let Some(preview) = session.preview.take() {
                 preview.destroy(conn);
             }
@@ -344,7 +381,15 @@ impl X11Session {
             let _ = conn.flush();
             return Err(error);
         }
-        conn.flush().map_err(x11_error)?;
+        if let Err(error) = conn.flush().map_err(x11_error) {
+            session.release_pointer(conn);
+            if let Some(preview) = session.preview.take() {
+                preview.destroy(conn);
+            }
+            let _ = conn.set_selection_owner(x11rb::NONE, session.atoms.xdnd_selection, press.time);
+            let _ = conn.flush();
+            return Err(error);
+        }
         Ok(session)
     }
 
@@ -359,6 +404,7 @@ impl X11Session {
         }
 
         if let Err(error) = self.drive_event(conn, event) {
+            self.release_pointer(conn);
             if let Some(preview) = self.preview.take() {
                 preview.destroy(conn);
             }
@@ -439,6 +485,7 @@ impl X11Session {
     /// Cancel from an authoritative toolkit teardown or gesture-cancel event.
     pub fn cancel<C: Connection>(mut self, conn: &C) -> Result<(), X11SessionError> {
         if !self.finished {
+            self.release_pointer(conn);
             if let Some(preview) = self.preview.take() {
                 preview.destroy(conn);
             }
@@ -454,6 +501,7 @@ impl X11Session {
     /// `XdndLeave`. The target action remains unconfirmed.
     pub fn supersede<C: Connection>(mut self, conn: &C) -> Result<(), X11SessionError> {
         if !self.finished {
+            self.release_pointer(conn);
             if let Some(preview) = self.preview.take() {
                 preview.destroy(conn);
             }
@@ -469,6 +517,13 @@ impl X11Session {
     fn note_event_time(&mut self, time: u32) {
         if time != CURRENT_TIME {
             self.last_event_time = time;
+        }
+    }
+
+    fn release_pointer<C: Connection>(&mut self, conn: &C) {
+        if self.pointer_grabbed {
+            let _ = conn.ungrab_pointer(self.last_event_time);
+            self.pointer_grabbed = false;
         }
     }
 
@@ -518,6 +573,7 @@ impl X11Session {
         event: &ButtonReleaseEvent,
     ) -> Result<(), X11SessionError> {
         self.note_event_time(event.time);
+        self.release_pointer(conn);
         if let Some(preview) = self.preview.take() {
             preview.destroy(conn);
         }
@@ -920,6 +976,7 @@ impl X11Session {
         conn: &C,
         outcome: LinuxOutcome,
     ) -> Result<(), X11SessionError> {
+        self.release_pointer(conn);
         if let Some(preview) = self.preview.take() {
             preview.destroy(conn);
         }
