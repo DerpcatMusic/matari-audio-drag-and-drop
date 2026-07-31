@@ -734,7 +734,10 @@ impl XdndSession {
                 if event.root == self.root && self.released_target.is_none() =>
             {
                 self.note_event_time(event.time);
-                let allow_underlying = self.note_source_leave(conn)?;
+                let source_point = (event.same_screen && event.event == self.source_window)
+                    .then_some((event.event_x, event.event_y));
+                let allow_underlying =
+                    self.note_source_leave(conn, source_point, event.root_x, event.root_y)?;
                 self.update_target(conn, event.root_x, event.root_y, allow_underlying)?;
                 self.move_preview(conn, event.root_x, event.root_y);
             }
@@ -866,7 +869,10 @@ impl XdndSession {
         if let Some(preview) = self.preview.take() {
             preview.destroy(conn);
         }
-        let allow_underlying = self.note_source_leave(conn)?;
+        let source_point = (event.same_screen && event.event == self.source_window)
+            .then_some((event.event_x, event.event_y));
+        let allow_underlying =
+            self.note_source_leave(conn, source_point, event.root_x, event.root_y)?;
         let target = self.find_xdnd_target(conn, event.root_x, event.root_y, allow_underlying)?;
         if target != self.current_target {
             self.leave_current_target(conn)?;
@@ -1071,30 +1077,52 @@ impl XdndSession {
         }
     }
 
-    fn note_source_leave<C: Connection>(&mut self, conn: &C) -> Result<bool, X11SessionError> {
-        let over_source = self.pointer_over_source(conn)?;
+    fn note_source_leave<C: Connection>(
+        &mut self,
+        conn: &C,
+        source_point: Option<(i16, i16)>,
+        root_x: i16,
+        root_y: i16,
+    ) -> Result<bool, X11SessionError> {
+        let over_source = if let Some((x, y)) = source_point {
+            let geometry = conn
+                .get_geometry(self.source_window)
+                .map_err(x11_error)?
+                .reply()
+                .map_err(x11_error)?;
+            x >= 0
+                && y >= 0
+                && i32::from(x) < i32::from(geometry.width)
+                && i32::from(y) < i32::from(geometry.height)
+        } else {
+            self.source_contains_root_point(conn, root_x, root_y)?
+        };
         if !over_source {
             self.saw_pointer_leave_source = true;
         }
         Ok(self.saw_pointer_leave_source && !over_source)
     }
 
-    fn pointer_over_source<C: Connection>(&self, conn: &C) -> Result<bool, X11SessionError> {
-        let mut window = self.root;
-        loop {
-            if window == self.source_window {
-                return Ok(true);
-            }
-            let pointer = conn
-                .query_pointer(window)
-                .map_err(x11_error)?
-                .reply()
-                .map_err(x11_error)?;
-            if pointer.child == x11rb::NONE {
-                return Ok(false);
-            }
-            window = pointer.child;
-        }
+    fn source_contains_root_point<C: Connection>(
+        &self,
+        conn: &C,
+        root_x: i16,
+        root_y: i16,
+    ) -> Result<bool, X11SessionError> {
+        let geometry = conn
+            .get_geometry(self.source_window)
+            .map_err(x11_error)?
+            .reply()
+            .map_err(x11_error)?;
+        let point = conn
+            .translate_coordinates(self.root, self.source_window, root_x, root_y)
+            .map_err(x11_error)?
+            .reply()
+            .map_err(x11_error)?;
+        Ok(point.dst_x >= 0
+            && point.dst_y >= 0
+            && i32::from(point.dst_x) < i32::from(geometry.width)
+            && i32::from(point.dst_y) < i32::from(geometry.height))
     }
 
     fn underlying_xdnd_target<C: Connection>(
@@ -1132,6 +1160,7 @@ impl XdndSession {
                 }
                 window = self.parent_of(conn, target)?;
             }
+            return Ok(None);
         }
         Ok(None)
     }

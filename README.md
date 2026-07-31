@@ -38,9 +38,9 @@ Hyprland uses its serial-less native Wayland compatibility route only when both
 the live X window manager and session identify Hyprland; unknown or unsupported
 bridges remain XDND-only. A live xwayland-satellite server overrides stale
 desktop labels because it does not bridge DND between X11 and native Wayland.
-XDND target discovery continues through mapped host windows after the live
-pointer ancestry confirms it left an overlapping source window. Neither route
-polls pointer state nor infers completion from elapsed time.
+XDND target discovery continues through mapped host windows after native
+pointer events confirm the cursor left an overlapping source window. Neither
+route polls pointer state nor infers completion from elapsed time.
 
 Compositors without an X11-source to native-Wayland bridge cannot make an
 embedded XWayland editor drop into native Wayland targets. Those sessions need
