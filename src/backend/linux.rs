@@ -44,6 +44,8 @@ pub enum X11BridgeEvidence {
     XwaylandSatellite,
     /// The live X server and session both identify Hyprland.
     HyprlandInstance,
+    /// The live X window manager identifies a canonical XDND bridge.
+    CanonicalWindowManager,
     /// The desktop environment indicates a canonical XDND bridge.
     DesktopEnvironment,
     /// No supported cross-display bridge was identified.
@@ -57,8 +59,9 @@ impl X11BridgeEvidence {
         match self {
             Self::XwaylandSatellite => "xwayland-satellite",
             Self::HyprlandInstance => "live Hyprland XWM and instance",
+            Self::CanonicalWindowManager => "canonical X window manager",
             Self::DesktopEnvironment => "desktop environment hint",
-            Self::None => "no supported bridge evidence",
+            Self::None => "no known cross-display bridge",
         }
     }
 }
@@ -71,6 +74,17 @@ pub struct X11BridgeReport {
     pub bridge: X11WaylandBridge,
     /// Live or environmental evidence used for the decision.
     pub evidence: X11BridgeEvidence,
+}
+
+impl X11BridgeReport {
+    /// Native protocol selected by this detection snapshot.
+    #[must_use]
+    pub const fn protocol(self) -> NativeProtocol {
+        match self.bridge {
+            X11WaylandBridge::HyprlandSeriallessCompat => NativeProtocol::WaylandDataDevice,
+            X11WaylandBridge::CanonicalXdnd | X11WaylandBridge::Unavailable => NativeProtocol::Xdnd,
+        }
+    }
 }
 
 /// Detect the compositor bridge available to this process.
@@ -101,11 +115,21 @@ pub fn x11_bridge_report() -> X11BridgeReport {
     if wayland_bridge::available()
         && window_manager
             .as_deref()
-            .is_some_and(|name| name.eq_ignore_ascii_case(b"Hyprland :D"))
+            .and_then(|name| name.get(..b"Hyprland".len()))
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(b"Hyprland"))
     {
         return X11BridgeReport {
             bridge: X11WaylandBridge::HyprlandSeriallessCompat,
             evidence: X11BridgeEvidence::HyprlandInstance,
+        };
+    }
+    if window_manager
+        .as_deref()
+        .is_some_and(|name| name.eq_ignore_ascii_case(b"Smithay X WM"))
+    {
+        return X11BridgeReport {
+            bridge: X11WaylandBridge::CanonicalXdnd,
+            evidence: X11BridgeEvidence::CanonicalWindowManager,
         };
     }
     let desktop = [
@@ -131,10 +155,7 @@ pub fn x11_bridge_report() -> X11BridgeReport {
 /// Native protocol an X11 or XWayland editor should start.
 #[must_use]
 pub fn x11_outbound_protocol() -> NativeProtocol {
-    match x11_wayland_bridge() {
-        X11WaylandBridge::HyprlandSeriallessCompat => NativeProtocol::WaylandDataDevice,
-        X11WaylandBridge::CanonicalXdnd | X11WaylandBridge::Unavailable => NativeProtocol::Xdnd,
-    }
+    x11_bridge_report().protocol()
 }
 
 fn live_x11_window_manager() -> Option<Vec<u8>> {

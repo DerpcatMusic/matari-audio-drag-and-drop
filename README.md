@@ -33,13 +33,12 @@ one-use press token and existing event queue.
 X11/XWayland starts consume the initiating pointer event and return an
 `X11Session`. The adapter selects the route before consuming the start ticket.
 XDND sessions use events forwarded from the owning X11 queue. Matari detects
-the compositor bridge explicitly: KWin and Mutter use canonical XDND,
+the compositor bridge explicitly: KWin, Mutter, and COSMIC use canonical XDND;
 Hyprland uses its serial-less native Wayland compatibility route only when both
-the live X window manager and session identify Hyprland, and unknown or
-unsupported bridges remain XDND-only. A live xwayland-satellite server
-overrides stale desktop labels because it does not bridge DND between X11 and
-native Wayland. Neither route queries pointer state nor infers completion from
-elapsed time.
+the live X window manager and session identify Hyprland; unknown or unsupported
+bridges remain XDND-only. A live xwayland-satellite server overrides stale
+desktop labels because it does not bridge DND between X11 and native Wayland.
+Neither route queries pointer state nor infers completion from elapsed time.
 
 Compositors without an X11-source to native-Wayland bridge cannot make an
 embedded XWayland editor drop into native Wayland targets. Those sessions need

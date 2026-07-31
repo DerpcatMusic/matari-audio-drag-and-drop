@@ -2,7 +2,7 @@
 
 ## 0.1.1 - Unreleased
 
-- Expose explicit KWin/Mutter canonical-XDND, Hyprland serial-less-Wayland, and unavailable cross-display capabilities instead of presenting one compositor workaround as universal.
+- Expose explicit KWin/Mutter/COSMIC canonical-XDND, Hyprland serial-less-Wayland, and unavailable cross-display capabilities instead of presenting one compositor workaround as universal.
 - Detect xwayland-satellite from the live X server and keep those editors on XDND even when launchers expose stale desktop labels.
 - Require both a live Hyprland X window manager and session before selecting its serial-less native Wayland compatibility route.
 - Route embedded XWayland editors on Hyprland through a native Wayland data-device source, including source previews and event-driven lifetime through late payload requests.
