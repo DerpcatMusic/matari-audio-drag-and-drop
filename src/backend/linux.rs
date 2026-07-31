@@ -383,14 +383,11 @@ impl X11Session {
     }
 
     /// Retire this handle when a transfer-ready session is superseded.
-    ///
-    /// A Wayland source is detached rather than cancelled so it can serve late
-    /// MIME requests until the compositor sends `dnd_finished` or `cancelled`.
     pub fn supersede<C: Connection>(self, conn: &C) -> Result<(), X11SessionError> {
         match self.inner {
             LinuxSession::Xdnd(session) => (*session).supersede(conn),
             LinuxSession::Wayland(session) => {
-                session.detach();
+                session.cancel();
                 Ok(())
             }
         }

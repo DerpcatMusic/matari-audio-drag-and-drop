@@ -142,7 +142,8 @@ impl PreparedWaylandBridge {
 }
 
 pub(super) struct WaylandBridgeSession {
-    commands: Option<channel::Sender<Command>>,
+    commands: channel::Sender<Command>,
+    worker: Option<thread::JoinHandle<()>>,
     transfer_ready: Arc<AtomicBool>,
     terminal: Arc<AtomicBool>,
 }
@@ -158,7 +159,7 @@ impl WaylandBridgeSession {
         let (commands, command_source) = channel::channel();
         let worker_ready = Arc::clone(&transfer_ready);
         let worker_terminal = Arc::clone(&terminal);
-        thread::Builder::new()
+        let worker = thread::Builder::new()
             .name("matari-wayland-dnd".to_owned())
             .spawn(move || {
                 let mut state = BridgeState {
@@ -190,7 +191,8 @@ impl WaylandBridgeSession {
                 WaylandBridgeError::new(format!("Wayland drag thread failed: {error}"))
             })?;
         Ok(WaylandBridgeSession {
-            commands: Some(commands),
+            commands,
+            worker: Some(worker),
             transfer_ready,
             terminal,
         })
@@ -204,14 +206,22 @@ impl WaylandBridgeSession {
         self.terminal.load(Ordering::Acquire)
     }
 
-    pub(super) fn cancel(&self) {
-        if let Some(commands) = &self.commands {
-            let _ = commands.send(Command::Cancel);
+    fn signal_cancel(&self) {
+        let _ = self.commands.send(Command::Cancel);
+    }
+
+    fn join_worker(&mut self) {
+        let Some(worker) = self.worker.take() else {
+            return;
+        };
+        if worker.thread().id() != thread::current().id() {
+            let _ = worker.join();
         }
     }
 
-    pub(super) fn detach(mut self) {
-        self.commands.take();
+    pub(super) fn cancel(mut self) {
+        self.signal_cancel();
+        self.join_worker();
     }
 }
 
@@ -253,8 +263,9 @@ impl fmt::Debug for WaylandBridgeSession {
 impl Drop for WaylandBridgeSession {
     fn drop(&mut self) {
         if !self.is_terminal() {
-            self.cancel();
+            self.signal_cancel();
         }
+        self.join_worker();
     }
 }
 
@@ -328,7 +339,7 @@ impl BridgeState {
             .and_then(|()| pipe.flush())
             .is_ok()
         {
-            self.reporter.data_requested();
+            self.reporter.bridge_payload_transferred();
             self.sync_transfer_ready();
         }
     }

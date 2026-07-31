@@ -4,10 +4,11 @@ use crate::{LinuxOutcome, Outcome, WaylandReporter};
 
 /// Reports one native Wayland source lifecycle without guessing completion.
 ///
-/// A source becomes replaceable only after the compositor reports a performed
-/// drop and the destination has received at least one requested payload. This
-/// is not terminal: runtimes must retain the native source until Wayland sends
-/// `dnd_finished` or `cancelled` so late MIME requests can still be served.
+/// Standard sources become replaceable after both a performed drop and a
+/// delivered payload. The serial-less Hyprland bridge may explicitly use full
+/// payload delivery because its XWayland bridge omits the drop callback.
+/// Replaceability is never terminal: the native source remains alive until
+/// Wayland sends `dnd_finished` or `cancelled`.
 pub struct WaylandSourceReporter {
     reporter: WaylandReporter,
     data_requested: bool,
@@ -49,6 +50,18 @@ impl WaylandSourceReporter {
         self.transfer_ready
     }
 
+    /// Mark a fully written payload as replaceable for the serial-less
+    /// Hyprland bridge, which may omit `dnd_drop_performed`.
+    ///
+    /// This is non-terminal and deliberately does not report a performed
+    /// drop. The native source must remain alive for late MIME requests and
+    /// authoritative `dnd_finished` or `cancelled` events.
+    pub(crate) fn bridge_payload_transferred(&mut self) {
+        self.reporter.data_requested();
+        self.data_requested = true;
+        self.mark_transfer_ready();
+    }
+
     /// Finish the source from an authoritative Linux terminal event.
     pub fn finish_linux(&self, outcome: LinuxOutcome) {
         self.reporter.finish_linux(outcome);
@@ -61,6 +74,12 @@ impl WaylandSourceReporter {
 
     fn report_transfer_ready(&mut self) {
         if !self.transfer_ready && self.data_requested && self.drop_performed {
+            self.mark_transfer_ready();
+        }
+    }
+
+    fn mark_transfer_ready(&mut self) {
+        if !self.transfer_ready {
             self.transfer_ready = true;
             self.reporter.transfer_ready();
         }

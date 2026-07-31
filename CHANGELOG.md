@@ -3,10 +3,10 @@
 ## 0.1.1 - Unreleased
 
 - Route embedded XWayland editors on Hyprland through a native Wayland data-device source, including source previews and event-driven lifetime through late payload requests.
-- Make XWayland-to-Wayland bridge transfers non-blocking after accepted protocol and payload-transfer events while retaining selection ownership and final authority for the target.
+- Keep Hyprland native-to-XWayland transfers replaceable after full payload delivery even when the compositor omits drop and finish callbacks, while retaining the source for late requests.
 - Keep event-driven X11 pointer authority and accepted-target evidence through button release so crossing onto a native Wayland surface cannot strand the drag.
 - Restore waveform, spectrogram, and MIDI source previews for event-driven X11/XWayland drags.
-- Add a reusable native-Wayland lifecycle reporter that becomes replaceable only after both payload delivery and a compositor drop event.
+- Add a reusable native-Wayland lifecycle reporter with distinct progress, replaceability, and terminal events.
 - Coalesce repeated native progress notifications into one data-request and one drop-performed event per drag.
 - Free Windows transfer allocations when native memory locking fails.
 - Document native unsafe invariants and the public X11 event lifecycle.
