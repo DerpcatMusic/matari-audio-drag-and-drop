@@ -4,7 +4,7 @@
 
 - Expose explicit KWin/Mutter canonical-XDND, Hyprland serial-less-Wayland, and unavailable cross-display capabilities instead of presenting one compositor workaround as universal.
 - Detect xwayland-satellite from the live X server and keep those editors on XDND even when launchers expose stale desktop labels.
-- Require a live Hyprland instance before selecting its serial-less native Wayland compatibility route.
+- Require both a live Hyprland X window manager and session before selecting its serial-less native Wayland compatibility route.
 - Route embedded XWayland editors on Hyprland through a native Wayland data-device source, including source previews and event-driven lifetime through late payload requests.
 - Keep Hyprland native-to-XWayland transfers replaceable after full payload delivery even when the compositor omits drop and finish callbacks, while retaining the source for late requests.
 - Keep event-driven X11 pointer authority and accepted-target evidence through button release so crossing onto a native Wayland surface cannot strand the drag.

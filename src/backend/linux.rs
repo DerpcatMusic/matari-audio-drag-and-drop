@@ -42,7 +42,7 @@ pub enum X11WaylandBridge {
 pub enum X11BridgeEvidence {
     /// The X server is owned by xwayland-satellite, which does not bridge DND.
     XwaylandSatellite,
-    /// A live Hyprland instance permits its serial-less compatibility route.
+    /// The live X server and session both identify Hyprland.
     HyprlandInstance,
     /// The desktop environment indicates a canonical XDND bridge.
     DesktopEnvironment,
@@ -56,7 +56,7 @@ impl X11BridgeEvidence {
     pub const fn summary(self) -> &'static str {
         match self {
             Self::XwaylandSatellite => "xwayland-satellite",
-            Self::HyprlandInstance => "live Hyprland instance",
+            Self::HyprlandInstance => "live Hyprland XWM and instance",
             Self::DesktopEnvironment => "desktop environment hint",
             Self::None => "no supported bridge evidence",
         }
@@ -82,7 +82,9 @@ pub fn x11_wayland_bridge() -> X11WaylandBridge {
 /// Detect the compositor bridge and retain the evidence used to select it.
 #[must_use]
 pub fn x11_bridge_report() -> X11BridgeReport {
-    if live_x11_window_manager()
+    let window_manager = live_x11_window_manager();
+    if window_manager
+        .as_deref()
         .is_some_and(|name| name.eq_ignore_ascii_case(b"xwayland-satellite"))
     {
         return X11BridgeReport {
@@ -96,7 +98,11 @@ pub fn x11_bridge_report() -> X11BridgeReport {
             evidence: X11BridgeEvidence::None,
         };
     }
-    if wayland_bridge::available() {
+    if wayland_bridge::available()
+        && window_manager
+            .as_deref()
+            .is_some_and(|name| name.eq_ignore_ascii_case(b"Hyprland :D"))
+    {
         return X11BridgeReport {
             bridge: X11WaylandBridge::HyprlandSeriallessCompat,
             evidence: X11BridgeEvidence::HyprlandInstance,
