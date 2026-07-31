@@ -2,6 +2,7 @@
 
 ## 0.1.1 - Unreleased
 
+- Route embedded XWayland editors on Hyprland through a native Wayland data-device source, including source previews and event-driven lifetime through late payload requests.
 - Make XWayland-to-Wayland bridge transfers non-blocking after accepted protocol and payload-transfer events while retaining selection ownership and final authority for the target.
 - Keep event-driven X11 pointer authority and accepted-target evidence through button release so crossing onto a native Wayland surface cannot strand the drag.
 - Restore waveform, spectrogram, and MIDI source previews for event-driven X11/XWayland drags.

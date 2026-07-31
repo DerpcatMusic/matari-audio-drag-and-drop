@@ -2,12 +2,15 @@ use std::error::Error;
 use std::fmt;
 
 mod mime;
+mod wayland_bridge;
 
 use crate::{
-    DragOrigin, FileDragPayloadData, FileSet, LinuxOutcome, LinuxRejector, SessionReporter,
+    DragOrigin, FileDragPayloadData, FileSet, LinuxOutcome, LinuxRejector, NativeProtocol,
+    SessionReporter, SessionRoute, SourceContext,
 };
 use mime::MimeTargets;
 use raw_window_handle::RawWindowHandle;
+use wayland_bridge::WaylandBridgeSession;
 use x11rb::CURRENT_TIME;
 use x11rb::connection::Connection;
 use x11rb::protocol::Event;
@@ -20,6 +23,13 @@ use x11rb::wrapper::ConnectionExt as _;
 
 const XDND_VERSION: u32 = 5;
 const STATUS_ACCEPT: u32 = 1;
+
+/// Whether this process can start Hyprland's serial-less native Wayland route
+/// from an embedded X11 or XWayland editor.
+#[must_use]
+pub fn serialless_wayland_available() -> bool {
+    wayland_bridge::available()
+}
 
 /// Authoritative pointer state from the X11 event that initiated a drag.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -251,9 +261,154 @@ impl PreviewWindow {
     }
 }
 
-/// XDND state owned by the toolkit event loop that owns the X11 connection.
+/// Outbound session selected for an X11 or XWayland editor.
+///
+/// Hyprland uses its native Wayland data-device source. Other desktops use
+/// XDND on the toolkit's X11 event queue.
 #[must_use = "the toolkit must drive this session or explicitly cancel it before teardown"]
 pub struct X11Session {
+    inner: LinuxSession,
+    route: SessionRoute,
+}
+
+enum LinuxSession {
+    Xdnd(Box<XdndSession>),
+    Wayland(WaylandBridgeSession),
+}
+
+impl fmt::Debug for X11Session {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match &self.inner {
+            LinuxSession::Xdnd(session) => session.fmt(formatter),
+            LinuxSession::Wayland(session) => session.fmt(formatter),
+        }
+    }
+}
+
+impl X11Session {
+    pub(crate) fn start<C: Connection>(
+        conn: &C,
+        origin: DragOrigin<'_>,
+        files: FileSet,
+        reporter: SessionReporter,
+        press: X11PointerEvent,
+        route: SessionRoute,
+    ) -> Result<Self, X11StartError> {
+        let source_window = x11_source_window(origin)?;
+        if press.root == x11rb::NONE || press.time == CURRENT_TIME {
+            return Err(X11SessionError::new(
+                "event-scoped drag requires the initiating X11 event root and timestamp",
+            ));
+        }
+        if route
+            == (SessionRoute {
+                protocol: NativeProtocol::WaylandDataDevice,
+                source: SourceContext::EmbeddedX11,
+            })
+        {
+            if !serialless_wayland_available() {
+                return Err(X11SessionError::new(
+                    "serial-less native Wayland is unavailable",
+                ));
+            }
+            return WaylandBridgeSession::start(files, reporter)
+                .map(|session| Self {
+                    inner: LinuxSession::Wayland(session),
+                    route,
+                })
+                .map_err(|error| X11SessionError::new(error.to_string()));
+        }
+        if route.protocol != NativeProtocol::Xdnd
+            || !matches!(
+                route.source,
+                SourceContext::EmbeddedX11 | SourceContext::DetachedX11
+            )
+        {
+            return Err(X11SessionError::new(
+                "selected route is not valid for an X11 or XWayland editor",
+            ));
+        }
+
+        XdndSession::start(conn, source_window, files, reporter, press).map(|session| Self {
+            inner: LinuxSession::Xdnd(Box::new(session)),
+            route,
+        })
+    }
+
+    /// Native protocol selected for this session.
+    #[must_use]
+    pub const fn route(&self) -> SessionRoute {
+        self.route
+    }
+
+    /// Drive an XDND session from the toolkit's event queue.
+    ///
+    /// Native Wayland sessions run on their own blocking protocol queue, so
+    /// X11 events only provide an opportunity to observe terminal state.
+    pub fn handle_event<C: Connection>(
+        &mut self,
+        conn: &C,
+        event: &Event,
+    ) -> Result<X11SessionStatus, X11SessionError> {
+        match &mut self.inner {
+            LinuxSession::Xdnd(session) => session.handle_event(conn, event),
+            LinuxSession::Wayland(session) => Ok(if session.is_terminal() {
+                X11SessionStatus::Finished
+            } else {
+                X11SessionStatus::Active
+            }),
+        }
+    }
+
+    /// Whether protocol evidence permits a new drag gesture.
+    ///
+    /// The native source remains alive to serve late MIME requests.
+    #[must_use]
+    pub fn transfer_complete(&self) -> bool {
+        match &self.inner {
+            LinuxSession::Xdnd(session) => session.transfer_complete(),
+            LinuxSession::Wayland(session) => session.transfer_complete() || session.is_terminal(),
+        }
+    }
+
+    /// Cancel from an authoritative toolkit teardown or gesture-cancel event.
+    pub fn cancel<C: Connection>(self, conn: &C) -> Result<(), X11SessionError> {
+        match self.inner {
+            LinuxSession::Xdnd(session) => (*session).cancel(conn),
+            LinuxSession::Wayland(session) => {
+                session.cancel();
+                Ok(())
+            }
+        }
+    }
+
+    /// Retire this handle when a transfer-ready session is superseded.
+    ///
+    /// A Wayland source is detached rather than cancelled so it can serve late
+    /// MIME requests until the compositor sends `dnd_finished` or `cancelled`.
+    pub fn supersede<C: Connection>(self, conn: &C) -> Result<(), X11SessionError> {
+        match self.inner {
+            LinuxSession::Xdnd(session) => (*session).supersede(conn),
+            LinuxSession::Wayland(session) => {
+                session.detach();
+                Ok(())
+            }
+        }
+    }
+}
+
+fn x11_source_window(origin: DragOrigin<'_>) -> Result<XWindow, X11StartError> {
+    match origin.window_handle().as_raw() {
+        RawWindowHandle::Xlib(handle) if handle.window != 0 => Ok(handle.window as XWindow),
+        RawWindowHandle::Xcb(handle) => Ok(handle.window.get()),
+        _ => Err(X11SessionError::new(
+            "event-scoped drag requires an X11 or XWayland origin",
+        )),
+    }
+}
+
+/// XDND state owned by the toolkit event loop that owns the X11 connection.
+struct XdndSession {
     atoms: XdndAtoms,
     root: XWindow,
     source_window: XWindow,
@@ -271,7 +426,7 @@ pub struct X11Session {
     finished: bool,
 }
 
-impl fmt::Debug for X11Session {
+impl fmt::Debug for XdndSession {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("X11Session")
@@ -281,29 +436,14 @@ impl fmt::Debug for X11Session {
     }
 }
 
-impl X11Session {
-    pub(crate) fn start<C: Connection>(
+impl XdndSession {
+    fn start<C: Connection>(
         conn: &C,
-        origin: DragOrigin<'_>,
+        source_window: XWindow,
         files: FileSet,
         reporter: SessionReporter,
         press: X11PointerEvent,
     ) -> Result<Self, X11StartError> {
-        let source_window = match origin.window_handle().as_raw() {
-            RawWindowHandle::Xlib(handle) if handle.window != 0 => handle.window as XWindow,
-            RawWindowHandle::Xcb(handle) => handle.window.get(),
-            _ => {
-                return Err(X11SessionError::new(
-                    "event-scoped XDND requires an X11 or XWayland origin",
-                ));
-            }
-        };
-        if press.root == x11rb::NONE || press.time == CURRENT_TIME {
-            return Err(X11SessionError::new(
-                "event-scoped XDND requires the initiating X11 event root and timestamp",
-            ));
-        }
-
         let (paths, preview) = files.into_parts();
         let atoms = XdndAtoms::new(conn)?;
         conn.set_selection_owner(source_window, atoms.xdnd_selection, press.time)
@@ -990,7 +1130,7 @@ impl X11Session {
     }
 }
 
-impl Drop for X11Session {
+impl Drop for XdndSession {
     fn drop(&mut self) {
         if !self.finished {
             self.reporter.finish_linux(LinuxOutcome::Cancelled);

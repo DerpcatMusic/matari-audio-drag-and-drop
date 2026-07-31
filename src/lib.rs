@@ -14,7 +14,10 @@ pub use preview::{DragPreview, MidiPreviewNote};
 pub use wayland::WaylandSourceReporter;
 
 #[cfg(all(target_family = "unix", not(target_os = "macos")))]
-pub use backend::{X11PointerEvent, X11Session, X11SessionError, X11SessionStatus, X11StartError};
+pub use backend::{
+    X11PointerEvent, X11Session, X11SessionError, X11SessionStatus, X11StartError,
+    serialless_wayland_available,
+};
 
 pub use facade::{
     Controller, DragOrigin, FailureKind, FailureStage, FileSet, FileSetError, Inbound,

@@ -8,8 +8,8 @@ Matari separates product decisions from native protocol work:
 - `ToolkitAdapter` connects the controller to a live GUI callback.
 - `StartTicket` is non-cloneable authority to start exactly one drag.
 - `NativeRuntimePort` covers OLE and AppKit runtimes.
-- `X11Session` runs XDND directly on the toolkit-owned X11 connection and
-  consumes only events forwarded from that connection's owning queue.
+- `X11Session` runs XDND on the toolkit-owned X11 connection, or a native
+  Wayland data-device source for embedded XWayland editors on Hyprland.
 - `WaylandRuntimePort` consumes an event-scoped runtime that owns the
   toolkit's one-use press token and existing Wayland queue.
 - `SessionReporter` delivers native lifecycle events without polling, timers,
@@ -31,9 +31,11 @@ Native Wayland starts consume an event-scoped runtime that owns the toolkit's
 one-use press token and existing event queue.
 
 X11/XWayland starts consume the initiating pointer event and return an
-`X11Session`. The toolkit forwards raw X11 events to that session; Matari does
-not create a second X11 connection, query pointer state, or infer completion
-from elapsed time.
+`X11Session`. The adapter selects the route before consuming the start ticket.
+XDND sessions use events forwarded from the owning X11 queue. On Hyprland,
+embedded XWayland sessions instead use a side Wayland connection because the
+compositor can deliver that native source to both Wayland and X11 targets.
+Neither route queries pointer state nor infers completion from elapsed time.
 
 Linux reporters distinguish successful export, target/compositor rejection,
 unsupported routes, and setup failure.

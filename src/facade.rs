@@ -589,10 +589,11 @@ impl StartTicket {
         }
     }
 
-    /// Commit XDND on the X11 connection and event queue owned by the toolkit.
+    /// Commit the adapter-selected route for an X11 or XWayland editor.
     ///
-    /// The returned session must receive every raw X11 event from that queue
-    /// through [`crate::X11Session::handle_event`].
+    /// Adapters may select native Wayland on supported Hyprland sessions via
+    /// [`crate::serialless_wayland_available`]. Other sessions select XDND on
+    /// the supplied X11 event queue.
     #[cfg(all(target_family = "unix", not(target_os = "macos")))]
     pub fn start_x11<C>(
         mut self,
@@ -608,12 +609,17 @@ impl StartTicket {
                 "start ticket was already consumed",
             ));
         };
-        if inner.route.protocol != NativeProtocol::Xdnd
-            || !matches!(
+        let route_is_xdnd = inner.route.protocol == NativeProtocol::Xdnd
+            && matches!(
                 inner.route.source,
                 SourceContext::EmbeddedX11 | SourceContext::DetachedX11
-            )
-        {
+            );
+        let route_is_serialless_wayland = inner.route
+            == (SessionRoute {
+                protocol: NativeProtocol::WaylandDataDevice,
+                source: SourceContext::EmbeddedX11,
+            });
+        if !route_is_xdnd && !route_is_serialless_wayland {
             send_terminal(
                 &inner.events,
                 inner.session,
@@ -621,7 +627,7 @@ impl StartTicket {
                 FailureKind::NativeRejected,
             );
             return Err(crate::X11SessionError::new(
-                "selected route is not an X11/XWayland XDND route",
+                "selected route is not valid for an X11 or XWayland editor",
             ));
         }
 
@@ -632,11 +638,19 @@ impl StartTicket {
             terminal: Arc::clone(&terminal),
             delivery: Arc::clone(&delivery),
         };
-        match crate::X11Session::start(connection, origin, inner.files, reporter, press) {
+        match crate::X11Session::start(
+            connection,
+            origin,
+            inner.files,
+            reporter,
+            press,
+            inner.route,
+        ) {
             Ok(session) => {
+                let route = session.route();
                 delivery.commit(TicketEvent::Started {
                     session: inner.session,
-                    route: inner.route,
+                    route,
                 });
                 Ok(session)
             }

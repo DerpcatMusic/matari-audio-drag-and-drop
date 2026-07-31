@@ -36,6 +36,8 @@ percent-encoding = "2.3"
 raw-window-handle = "0.6"
 
 [target.'cfg(all(target_family = "unix", not(target_os = "macos")))'.dependencies]
+smithay-client-toolkit = { version = "0.21", default-features = false, features = ["calloop"] }
+wayland-client = { version = "0.31", features = ["system"] }
 x11rb = "0.13"
 
 [target.'cfg(target_os = "windows")'.dependencies]

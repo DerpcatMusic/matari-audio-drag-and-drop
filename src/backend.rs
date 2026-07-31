@@ -22,7 +22,10 @@ use crate::{NativeProtocol, SourceContext};
 #[cfg(all(target_family = "unix", not(target_os = "macos")))]
 mod linux;
 #[cfg(all(target_family = "unix", not(target_os = "macos")))]
-pub use linux::{X11PointerEvent, X11Session, X11SessionError, X11SessionStatus, X11StartError};
+pub use linux::{
+    X11PointerEvent, X11Session, X11SessionError, X11SessionStatus, X11StartError,
+    serialless_wayland_available,
+};
 
 #[cfg(target_os = "macos")]
 mod macos;
