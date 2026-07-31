@@ -67,9 +67,7 @@ impl Error for WaylandBridgeError {}
 
 pub(crate) fn available() -> bool {
     std::env::var_os("WAYLAND_DISPLAY").is_some()
-        && (std::env::var_os("HYPRLAND_INSTANCE_SIGNATURE").is_some()
-            || std::env::var("XDG_CURRENT_DESKTOP")
-                .is_ok_and(|desktop| desktop.to_ascii_lowercase().contains("hyprland")))
+        && std::env::var_os("HYPRLAND_INSTANCE_SIGNATURE").is_some()
 }
 
 struct PreparedWaylandBridge {

@@ -36,14 +36,71 @@ pub enum X11WaylandBridge {
     Unavailable,
 }
 
+/// Live evidence used to classify an X11 editor's Wayland bridge.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum X11BridgeEvidence {
+    /// The X server is owned by xwayland-satellite, which does not bridge DND.
+    XwaylandSatellite,
+    /// A live Hyprland instance permits its serial-less compatibility route.
+    HyprlandInstance,
+    /// The desktop environment indicates a canonical XDND bridge.
+    DesktopEnvironment,
+    /// No supported cross-display bridge was identified.
+    None,
+}
+
+impl X11BridgeEvidence {
+    /// Human-readable route evidence for diagnostics.
+    #[must_use]
+    pub const fn summary(self) -> &'static str {
+        match self {
+            Self::XwaylandSatellite => "xwayland-satellite",
+            Self::HyprlandInstance => "live Hyprland instance",
+            Self::DesktopEnvironment => "desktop environment hint",
+            Self::None => "no supported bridge evidence",
+        }
+    }
+}
+
+/// Detected X11-to-Wayland bridge and the evidence behind it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub struct X11BridgeReport {
+    /// Bridge available to the editor.
+    pub bridge: X11WaylandBridge,
+    /// Live or environmental evidence used for the decision.
+    pub evidence: X11BridgeEvidence,
+}
+
 /// Detect the compositor bridge available to this process.
 #[must_use]
 pub fn x11_wayland_bridge() -> X11WaylandBridge {
-    if wayland_bridge::available() {
-        return X11WaylandBridge::HyprlandSeriallessCompat;
+    x11_bridge_report().bridge
+}
+
+/// Detect the compositor bridge and retain the evidence used to select it.
+#[must_use]
+pub fn x11_bridge_report() -> X11BridgeReport {
+    if live_x11_window_manager()
+        .is_some_and(|name| name.eq_ignore_ascii_case(b"xwayland-satellite"))
+    {
+        return X11BridgeReport {
+            bridge: X11WaylandBridge::Unavailable,
+            evidence: X11BridgeEvidence::XwaylandSatellite,
+        };
     }
     if std::env::var_os("WAYLAND_DISPLAY").is_none() {
-        return X11WaylandBridge::Unavailable;
+        return X11BridgeReport {
+            bridge: X11WaylandBridge::Unavailable,
+            evidence: X11BridgeEvidence::None,
+        };
+    }
+    if wayland_bridge::available() {
+        return X11BridgeReport {
+            bridge: X11WaylandBridge::HyprlandSeriallessCompat,
+            evidence: X11BridgeEvidence::HyprlandInstance,
+        };
     }
     let desktop = [
         std::env::var_os("XDG_CURRENT_DESKTOP"),
@@ -53,9 +110,15 @@ pub fn x11_wayland_bridge() -> X11WaylandBridge {
         let desktop = desktop.to_string_lossy().to_ascii_lowercase();
         desktop.contains("kde") || desktop.contains("plasma") || desktop.contains("gnome")
     }) {
-        X11WaylandBridge::CanonicalXdnd
+        X11BridgeReport {
+            bridge: X11WaylandBridge::CanonicalXdnd,
+            evidence: X11BridgeEvidence::DesktopEnvironment,
+        }
     } else {
-        X11WaylandBridge::Unavailable
+        X11BridgeReport {
+            bridge: X11WaylandBridge::Unavailable,
+            evidence: X11BridgeEvidence::None,
+        }
     }
 }
 
@@ -66,6 +129,26 @@ pub fn x11_outbound_protocol() -> NativeProtocol {
         X11WaylandBridge::HyprlandSeriallessCompat => NativeProtocol::WaylandDataDevice,
         X11WaylandBridge::CanonicalXdnd | X11WaylandBridge::Unavailable => NativeProtocol::Xdnd,
     }
+}
+
+fn live_x11_window_manager() -> Option<Vec<u8>> {
+    let (connection, screen_index) = x11rb::connect(None).ok()?;
+    let root = connection.setup().roots.get(screen_index)?.root;
+    let supporting_window_atom = atom(&connection, b"_NET_SUPPORTING_WM_CHECK").ok()?;
+    let supporting_window = connection
+        .get_property(false, root, supporting_window_atom, AtomEnum::WINDOW, 0, 1)
+        .ok()?
+        .reply()
+        .ok()?
+        .value32()?
+        .next()?;
+    let name_atom = atom(&connection, b"_NET_WM_NAME").ok()?;
+    connection
+        .get_property(false, supporting_window, name_atom, AtomEnum::ANY, 0, 64)
+        .ok()?
+        .reply()
+        .ok()
+        .map(|reply| reply.value)
 }
 
 /// Authoritative pointer state from the X11 event that initiated a drag.
