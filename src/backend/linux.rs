@@ -16,9 +16,8 @@ use x11rb::connection::Connection;
 use x11rb::protocol::Event;
 use x11rb::protocol::xproto::{
     Atom, AtomEnum, ButtonReleaseEvent, ClientMessageEvent, ConfigureWindowAux, ConnectionExt,
-    CreateGCAux, CreateWindowAux, EventMask, Gcontext, GrabMode, GrabStatus, ImageFormat, MapState,
-    PropMode, SelectionNotifyEvent, SelectionRequestEvent, StackMode, Window as XWindow,
-    WindowClass,
+    CreateGCAux, CreateWindowAux, EventMask, Gcontext, GrabMode, GrabStatus, ImageFormat, PropMode,
+    SelectionNotifyEvent, SelectionRequestEvent, StackMode, Window as XWindow, WindowClass,
 };
 use x11rb::wrapper::ConnectionExt as _;
 
@@ -565,7 +564,6 @@ struct XdndSession {
     payload_target: Option<XWindow>,
     transfer_complete: bool,
     pointer_grabbed: bool,
-    saw_pointer_leave_source: bool,
     preview: Option<PreviewWindow>,
     last_event_time: u32,
     reporter: SessionReporter,
@@ -653,13 +651,12 @@ impl XdndSession {
             payload_target: None,
             transfer_complete: false,
             pointer_grabbed: true,
-            saw_pointer_leave_source: false,
             preview,
             last_event_time: press.time,
             reporter,
             finished: false,
         };
-        if let Err(error) = session.update_target(conn, press.root_x, press.root_y, false) {
+        if let Err(error) = session.update_target(conn, press.root_x, press.root_y) {
             session.release_pointer(conn);
             if let Some(preview) = session.preview.take() {
                 preview.destroy(conn);
@@ -734,12 +731,8 @@ impl XdndSession {
                 if event.root == self.root && self.released_target.is_none() =>
             {
                 self.note_event_time(event.time);
-                let source_point = (event.same_screen && event.event == self.source_window)
-                    .then_some((event.event_x, event.event_y));
-                let allow_underlying =
-                    self.note_source_leave(conn, source_point, event.root_x, event.root_y)?;
-                self.update_target(conn, event.root_x, event.root_y, allow_underlying)?;
                 self.move_preview(conn, event.root_x, event.root_y);
+                self.update_target(conn, event.root_x, event.root_y)?;
             }
             Event::ButtonRelease(event)
                 if event.detail == 1
@@ -843,9 +836,8 @@ impl XdndSession {
         conn: &C,
         root_x: i16,
         root_y: i16,
-        allow_underlying: bool,
     ) -> Result<(), X11SessionError> {
-        let target = self.find_xdnd_target(conn, root_x, root_y, allow_underlying)?;
+        let target = self.find_xdnd_target(conn)?;
         if target != self.current_target {
             self.leave_current_target(conn)?;
             self.current_target = target;
@@ -869,11 +861,7 @@ impl XdndSession {
         if let Some(preview) = self.preview.take() {
             preview.destroy(conn);
         }
-        let source_point = (event.same_screen && event.event == self.source_window)
-            .then_some((event.event_x, event.event_y));
-        let allow_underlying =
-            self.note_source_leave(conn, source_point, event.root_x, event.root_y)?;
-        let target = self.find_xdnd_target(conn, event.root_x, event.root_y, allow_underlying)?;
+        let target = self.find_xdnd_target(conn)?;
         if target != self.current_target {
             self.leave_current_target(conn)?;
             self.current_target = target;
@@ -1056,170 +1044,34 @@ impl XdndSession {
     fn find_xdnd_target<C: Connection>(
         &self,
         conn: &C,
-        root_x: i16,
-        root_y: i16,
-        allow_underlying: bool,
     ) -> Result<Option<XdndTarget>, X11SessionError> {
-        let mut window = self.window_at(conn, self.root, root_x, root_y)?;
+        let mut candidate = self.root;
+        loop {
+            let pointer = conn
+                .query_pointer(candidate)
+                .map_err(x11_error)?
+                .reply()
+                .map_err(x11_error)?;
+            if pointer.child == x11rb::NONE {
+                break;
+            }
+            candidate = pointer.child;
+            if candidate == self.source_window {
+                return Ok(None);
+            }
+        }
+
+        let mut window = (candidate != self.root).then_some(candidate);
         while let Some(candidate) = window {
             if candidate == self.source_window {
-                break;
+                return Ok(None);
             }
             if self.is_xdnd_aware(conn, candidate)? {
                 return self.target(conn, candidate).map(Some);
             }
             window = self.parent_of(conn, candidate)?;
         }
-        if allow_underlying {
-            self.underlying_xdnd_target(conn, root_x, root_y)
-        } else {
-            Ok(None)
-        }
-    }
-
-    fn note_source_leave<C: Connection>(
-        &mut self,
-        conn: &C,
-        source_point: Option<(i16, i16)>,
-        root_x: i16,
-        root_y: i16,
-    ) -> Result<bool, X11SessionError> {
-        let over_source = if let Some((x, y)) = source_point {
-            let geometry = conn
-                .get_geometry(self.source_window)
-                .map_err(x11_error)?
-                .reply()
-                .map_err(x11_error)?;
-            x >= 0
-                && y >= 0
-                && i32::from(x) < i32::from(geometry.width)
-                && i32::from(y) < i32::from(geometry.height)
-        } else {
-            self.source_contains_root_point(conn, root_x, root_y)?
-        };
-        if !over_source {
-            self.saw_pointer_leave_source = true;
-        }
-        Ok(self.saw_pointer_leave_source && !over_source)
-    }
-
-    fn source_contains_root_point<C: Connection>(
-        &self,
-        conn: &C,
-        root_x: i16,
-        root_y: i16,
-    ) -> Result<bool, X11SessionError> {
-        let geometry = conn
-            .get_geometry(self.source_window)
-            .map_err(x11_error)?
-            .reply()
-            .map_err(x11_error)?;
-        let point = conn
-            .translate_coordinates(self.root, self.source_window, root_x, root_y)
-            .map_err(x11_error)?
-            .reply()
-            .map_err(x11_error)?;
-        Ok(point.dst_x >= 0
-            && point.dst_y >= 0
-            && i32::from(point.dst_x) < i32::from(geometry.width)
-            && i32::from(point.dst_y) < i32::from(geometry.height))
-    }
-
-    fn underlying_xdnd_target<C: Connection>(
-        &self,
-        conn: &C,
-        root_x: i16,
-        root_y: i16,
-    ) -> Result<Option<XdndTarget>, X11SessionError> {
-        let tree = conn
-            .query_tree(self.root)
-            .map_err(x11_error)?
-            .reply()
-            .map_err(x11_error)?;
-        for candidate in tree.children.iter().rev().copied() {
-            if candidate == self.source_window
-                || self
-                    .preview
-                    .as_ref()
-                    .is_some_and(|preview| candidate == preview.window)
-                || !self.window_contains_root_point(conn, candidate, root_x, root_y)
-            {
-                continue;
-            }
-
-            let mut window = self.window_at(conn, candidate, root_x, root_y)?;
-            while let Some(target) = window {
-                if target == self.source_window {
-                    break;
-                }
-                if self.is_xdnd_aware(conn, target)? {
-                    return self.target(conn, target).map(Some);
-                }
-                if target == candidate {
-                    break;
-                }
-                window = self.parent_of(conn, target)?;
-            }
-            return Ok(None);
-        }
         Ok(None)
-    }
-
-    fn window_at<C: Connection>(
-        &self,
-        conn: &C,
-        window: XWindow,
-        root_x: i16,
-        root_y: i16,
-    ) -> Result<Option<XWindow>, X11SessionError> {
-        let mut current = window;
-        loop {
-            let tree = conn
-                .query_tree(current)
-                .map_err(x11_error)?
-                .reply()
-                .map_err(x11_error)?;
-            let child = tree.children.iter().rev().copied().find(|&candidate| {
-                self.preview
-                    .as_ref()
-                    .is_none_or(|preview| candidate != preview.window)
-                    && self.window_contains_root_point(conn, candidate, root_x, root_y)
-            });
-            let Some(child) = child else {
-                return Ok((current != self.source_window).then_some(current));
-            };
-            current = child;
-        }
-    }
-
-    fn window_contains_root_point<C: Connection>(
-        &self,
-        conn: &C,
-        window: XWindow,
-        root_x: i16,
-        root_y: i16,
-    ) -> bool {
-        conn.get_window_attributes(window)
-            .ok()
-            .and_then(|cookie| cookie.reply().ok())
-            .filter(|attributes| attributes.map_state == MapState::VIEWABLE)
-            .and_then(|_| {
-                conn.get_geometry(window)
-                    .ok()
-                    .and_then(|cookie| cookie.reply().ok())
-            })
-            .and_then(|geometry| {
-                conn.translate_coordinates(self.root, window, root_x, root_y)
-                    .ok()
-                    .and_then(|cookie| cookie.reply().ok())
-                    .map(|point| {
-                        point.dst_x >= 0
-                            && point.dst_y >= 0
-                            && i32::from(point.dst_x) < i32::from(geometry.width)
-                            && i32::from(point.dst_y) < i32::from(geometry.height)
-                    })
-            })
-            .unwrap_or(false)
     }
 
     fn parent_of<C: Connection>(
