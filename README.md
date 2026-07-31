@@ -32,10 +32,16 @@ one-use press token and existing event queue.
 
 X11/XWayland starts consume the initiating pointer event and return an
 `X11Session`. The adapter selects the route before consuming the start ticket.
-XDND sessions use events forwarded from the owning X11 queue. On Hyprland,
-embedded XWayland sessions instead use a side Wayland connection because the
-compositor can deliver that native source to both Wayland and X11 targets.
-Neither route queries pointer state nor infers completion from elapsed time.
+XDND sessions use events forwarded from the owning X11 queue. Matari detects
+the compositor bridge explicitly: KWin and Mutter use canonical XDND,
+Hyprland uses its serial-less native Wayland compatibility route, and unknown
+or unsupported bridges remain XDND-only. Neither route queries pointer state
+nor infers completion from elapsed time.
+
+Compositors without an X11-source to native-Wayland bridge cannot make an
+embedded XWayland editor drop into native Wayland targets. Those sessions need
+a native Wayland editor with a real toolkit press serial; XDND remains
+available for X11/XWayland targets.
 
 Linux reporters distinguish successful export, target/compositor rejection,
 unsupported routes, and setup failure.

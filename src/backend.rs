@@ -24,7 +24,7 @@ mod linux;
 #[cfg(all(target_family = "unix", not(target_os = "macos")))]
 pub use linux::{
     X11PointerEvent, X11Session, X11SessionError, X11SessionStatus, X11StartError,
-    serialless_wayland_available,
+    X11WaylandBridge, x11_outbound_protocol, x11_wayland_bridge,
 };
 
 #[cfg(target_os = "macos")]

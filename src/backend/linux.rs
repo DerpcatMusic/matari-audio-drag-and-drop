@@ -24,11 +24,48 @@ use x11rb::wrapper::ConnectionExt as _;
 const XDND_VERSION: u32 = 5;
 const STATUS_ACCEPT: u32 = 1;
 
-/// Whether this process can start Hyprland's serial-less native Wayland route
-/// from an embedded X11 or XWayland editor.
+/// Cross-display bridge available to an X11 or XWayland editor.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum X11WaylandBridge {
+    /// KWin or Mutter translates the editor's canonical XDND source.
+    CanonicalXdnd,
+    /// Hyprland accepts a native Wayland source without a Wayland press serial.
+    HyprlandSeriallessCompat,
+    /// No supported X11-source to native-Wayland bridge is known.
+    Unavailable,
+}
+
+/// Detect the compositor bridge available to this process.
 #[must_use]
-pub fn serialless_wayland_available() -> bool {
-    wayland_bridge::available()
+pub fn x11_wayland_bridge() -> X11WaylandBridge {
+    if wayland_bridge::available() {
+        return X11WaylandBridge::HyprlandSeriallessCompat;
+    }
+    if std::env::var_os("WAYLAND_DISPLAY").is_none() {
+        return X11WaylandBridge::Unavailable;
+    }
+    let desktop = [
+        std::env::var_os("XDG_CURRENT_DESKTOP"),
+        std::env::var_os("XDG_SESSION_DESKTOP"),
+    ];
+    if desktop.iter().flatten().any(|desktop| {
+        let desktop = desktop.to_string_lossy().to_ascii_lowercase();
+        desktop.contains("kde") || desktop.contains("plasma") || desktop.contains("gnome")
+    }) {
+        X11WaylandBridge::CanonicalXdnd
+    } else {
+        X11WaylandBridge::Unavailable
+    }
+}
+
+/// Native protocol an X11 or XWayland editor should start.
+#[must_use]
+pub fn x11_outbound_protocol() -> NativeProtocol {
+    match x11_wayland_bridge() {
+        X11WaylandBridge::HyprlandSeriallessCompat => NativeProtocol::WaylandDataDevice,
+        X11WaylandBridge::CanonicalXdnd | X11WaylandBridge::Unavailable => NativeProtocol::Xdnd,
+    }
 }
 
 /// Authoritative pointer state from the X11 event that initiated a drag.
@@ -300,13 +337,13 @@ impl X11Session {
                 "event-scoped drag requires the initiating X11 event root and timestamp",
             ));
         }
-        if route
-            == (SessionRoute {
-                protocol: NativeProtocol::WaylandDataDevice,
-                source: SourceContext::EmbeddedX11,
-            })
+        if route.protocol == NativeProtocol::WaylandDataDevice
+            && matches!(
+                route.source,
+                SourceContext::EmbeddedX11 | SourceContext::DetachedX11
+            )
         {
-            if !serialless_wayland_available() {
+            if x11_outbound_protocol() != NativeProtocol::WaylandDataDevice {
                 return Err(X11SessionError::new(
                     "serial-less native Wayland is unavailable",
                 ));

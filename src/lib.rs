@@ -16,7 +16,7 @@ pub use wayland::WaylandSourceReporter;
 #[cfg(all(target_family = "unix", not(target_os = "macos")))]
 pub use backend::{
     X11PointerEvent, X11Session, X11SessionError, X11SessionStatus, X11StartError,
-    serialless_wayland_available,
+    X11WaylandBridge, x11_outbound_protocol, x11_wayland_bridge,
 };
 
 pub use facade::{

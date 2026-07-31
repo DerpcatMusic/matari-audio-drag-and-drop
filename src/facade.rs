@@ -591,8 +591,8 @@ impl StartTicket {
 
     /// Commit the adapter-selected route for an X11 or XWayland editor.
     ///
-    /// Adapters may select native Wayland on supported Hyprland sessions via
-    /// [`crate::serialless_wayland_available`]. Other sessions select XDND on
+    /// Adapters select the compositor-compatible protocol via
+    /// [`crate::x11_outbound_protocol`]. Other sessions select XDND on
     /// the supplied X11 event queue.
     #[cfg(all(target_family = "unix", not(target_os = "macos")))]
     pub fn start_x11<C>(
@@ -614,11 +614,11 @@ impl StartTicket {
                 inner.route.source,
                 SourceContext::EmbeddedX11 | SourceContext::DetachedX11
             );
-        let route_is_serialless_wayland = inner.route
-            == (SessionRoute {
-                protocol: NativeProtocol::WaylandDataDevice,
-                source: SourceContext::EmbeddedX11,
-            });
+        let route_is_serialless_wayland = inner.route.protocol == NativeProtocol::WaylandDataDevice
+            && matches!(
+                inner.route.source,
+                SourceContext::EmbeddedX11 | SourceContext::DetachedX11
+            );
         if !route_is_xdnd && !route_is_serialless_wayland {
             send_terminal(
                 &inner.events,
