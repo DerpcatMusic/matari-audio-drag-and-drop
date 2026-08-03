@@ -2,6 +2,7 @@
 
 ## 0.1.1 - Unreleased
 
+- Render native drag previews as rounded, high-contrast dark cards so toolkit and desktop handoff previews remain visually consistent.
 - Expose explicit KWin/Mutter/COSMIC canonical-XDND, Hyprland serial-less-Wayland, and unavailable cross-display capabilities instead of presenting one compositor workaround as universal.
 - Detect xwayland-satellite from the live X server and keep those editors on XDND even when launchers expose stale desktop labels.
 - Keep XDND host targets reachable when independently positioned XWayland editor and DAW windows overlap in X11 coordinates.

@@ -38,22 +38,16 @@ pub(crate) const HEIGHT: usize = 90;
 
 pub(crate) fn render(preview: &DragPreview) -> Vec<u8> {
     let mut pixels = vec![0_u8; WIDTH * HEIGHT * 4];
-    fill_rect(&mut pixels, 3, 4, WIDTH - 8, HEIGHT - 9, [18, 16, 28, 255]);
-    fill_rect(
+    fill_rounded_rect(&mut pixels, 3, 4, WIDTH - 3, HEIGHT - 4, 12, [0, 0, 0, 64]);
+    fill_rounded_rect(&mut pixels, 0, 0, WIDTH, HEIGHT, 12, [22, 141, 204, 255]);
+    fill_rounded_rect(
         &mut pixels,
-        9,
-        10,
-        WIDTH - 20,
-        HEIGHT - 21,
-        [13, 19, 30, 255],
-    );
-    stroke_rect(
-        &mut pixels,
-        3,
-        4,
-        WIDTH - 8,
-        HEIGHT - 9,
-        [95, 110, 132, 255],
+        1,
+        1,
+        WIDTH - 2,
+        HEIGHT - 2,
+        11,
+        [25, 25, 25, 255],
     );
 
     match preview {
@@ -74,7 +68,7 @@ fn waveform(pixels: &mut [u8], buckets: &[(f32, f32)]) {
     const TOP: usize = 15;
     const BOTTOM: usize = HEIGHT - 17;
     let center = (TOP + BOTTOM) / 2;
-    horizontal(pixels, LEFT, RIGHT, center, [75, 98, 124, 255]);
+    horizontal(pixels, LEFT, RIGHT, center, [22, 141, 204, 128]);
     let last = buckets.len().saturating_sub(1).max(1);
     for (index, &(minimum, maximum)) in buckets.iter().enumerate() {
         let x = LEFT + index * (RIGHT - LEFT) / last;
@@ -91,7 +85,7 @@ fn waveform(pixels: &mut [u8], buckets: &[(f32, f32)]) {
             a.min(b),
             2,
             a.max(b).saturating_sub(a.min(b)).max(1),
-            [169, 222, 255, 255],
+            [0, 170, 255, 255],
         );
     }
 }
@@ -145,18 +139,18 @@ fn midi(pixels: &mut [u8], notes: &[MidiPreviewNote]) {
             (TOP + (1.0 - note.pitch.clamp(0.0, 1.0)) * (DRAW_HEIGHT - height)).round() as usize,
             ((end - start) * DRAW_WIDTH).round().max(2.0) as usize,
             height.round() as usize,
-            [120, 210, 190, 255],
+            [0, 170, 255, 255],
         );
     }
 }
 
 fn spectral_color(value: f32) -> [u8; 4] {
     let (from, to, amount) = if value < 0.55 {
-        ([45.0, 54.0, 82.0], [49.0, 180.0, 178.0], value / 0.55)
+        ([25.0, 25.0, 25.0], [0.0, 170.0, 255.0], value / 0.55)
     } else {
         (
-            [49.0, 180.0, 178.0],
-            [247.0, 214.0, 112.0],
+            [0.0, 170.0, 255.0],
+            [37.0, 231.0, 255.0],
             (value - 0.55) / 0.45,
         )
     };
@@ -176,11 +170,35 @@ fn fill_rect(pixels: &mut [u8], x: usize, y: usize, width: usize, height: usize,
     }
 }
 
-fn stroke_rect(pixels: &mut [u8], x: usize, y: usize, width: usize, height: usize, color: [u8; 4]) {
-    horizontal(pixels, x, x + width - 1, y, color);
-    horizontal(pixels, x, x + width - 1, y + height - 1, color);
-    fill_rect(pixels, x, y, 1, height, color);
-    fill_rect(pixels, x + width - 1, y, 1, height, color);
+fn fill_rounded_rect(
+    pixels: &mut [u8],
+    x: usize,
+    y: usize,
+    width: usize,
+    height: usize,
+    radius: usize,
+    color: [u8; 4],
+) {
+    let right = x.saturating_add(width).min(WIDTH);
+    let bottom = y.saturating_add(height).min(HEIGHT);
+    let radius = radius.min(width / 2).min(height / 2);
+    for row in y..bottom {
+        for column in x..right {
+            let dx = if column < x + radius {
+                x + radius - column
+            } else {
+                column.saturating_sub(right.saturating_sub(radius + 1))
+            };
+            let dy = if row < y + radius {
+                y + radius - row
+            } else {
+                row.saturating_sub(bottom.saturating_sub(radius + 1))
+            };
+            if dx == 0 || dy == 0 || dx * dx + dy * dy <= radius * radius {
+                set_pixel(pixels, column, row, color);
+            }
+        }
+    }
 }
 
 fn horizontal(pixels: &mut [u8], left: usize, right: usize, y: usize, color: [u8; 4]) {
@@ -194,5 +212,11 @@ fn set_pixel(pixels: &mut [u8], x: usize, y: usize, rgba: [u8; 4]) {
         return;
     }
     let offset = (y * WIDTH + x) * 4;
-    pixels[offset..offset + 4].copy_from_slice(&[rgba[2], rgba[1], rgba[0], rgba[3]]);
+    let alpha = u16::from(rgba[3]);
+    pixels[offset..offset + 4].copy_from_slice(&[
+        (u16::from(rgba[2]) * alpha / 255) as u8,
+        (u16::from(rgba[1]) * alpha / 255) as u8,
+        (u16::from(rgba[0]) * alpha / 255) as u8,
+        rgba[3],
+    ]);
 }
