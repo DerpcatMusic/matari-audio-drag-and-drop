@@ -365,10 +365,10 @@ impl BridgeState {
             transfer_ready,
             terminal,
         });
-        if let Err(error) = self.connection.flush() {
+        if let Err(error) = self.connection.roundtrip() {
             self.fail_active();
             return Err(WaylandBridgeError::new(format!(
-                "Wayland flush failed: {error}"
+                "Wayland drag acknowledgement failed: {error}"
             )));
         }
         Ok(())

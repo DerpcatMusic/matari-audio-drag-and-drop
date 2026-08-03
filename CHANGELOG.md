@@ -1,8 +1,12 @@
 # Changelog
 
+## 0.1.4 - Unreleased
+
+- Wait for Hyprland to process native Wayland drag setup before returning control to an XWayland editor, preventing pointer release from overtaking compositor setup.
+
 ## 0.1.3 - Unreleased
 
-- Keep Hyprland's serial-less Wayland data-device runtime alive across XWayland plug-in drags, matching native client lifecycle and preventing per-gesture bridge teardown from stranding later drops.
+- Keep Hyprland's serial-less Wayland data-device runtime alive across XWayland plug-in drags instead of rebuilding its connection for every gesture.
 
 ## 0.1.2 - Unreleased
 
