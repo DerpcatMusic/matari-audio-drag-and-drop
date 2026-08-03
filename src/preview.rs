@@ -99,19 +99,34 @@ fn spectral(pixels: &mut [u8], columns: usize, rows: usize, energy: &[f32]) {
     const DRAW_WIDTH: usize = WIDTH - 28;
     const DRAW_HEIGHT: usize = HEIGHT - 28;
     for y in 0..DRAW_HEIGHT {
-        let row = rows
-            .saturating_sub(1)
-            .saturating_sub(y * rows / DRAW_HEIGHT);
         for x in 0..DRAW_WIDTH {
-            let column = x * columns / DRAW_WIDTH;
-            let value = energy
-                .get(column.saturating_mul(rows).saturating_add(row))
-                .copied()
-                .unwrap_or_default()
-                .clamp(0.0, 1.0);
+            let column = x as f32 * columns.saturating_sub(1) as f32
+                / DRAW_WIDTH.saturating_sub(1).max(1) as f32;
+            let row = (DRAW_HEIGHT - 1 - y) as f32 * rows.saturating_sub(1) as f32
+                / DRAW_HEIGHT.saturating_sub(1).max(1) as f32;
+            let value = sample_spectral(energy, columns, rows, column, row);
             set_pixel(pixels, LEFT + x, TOP + y, spectral_color(value));
         }
     }
+}
+
+fn sample_spectral(energy: &[f32], columns: usize, rows: usize, column: f32, row: f32) -> f32 {
+    let x0 = column.floor() as usize;
+    let y0 = row.floor() as usize;
+    let x1 = (x0 + 1).min(columns - 1);
+    let y1 = (y0 + 1).min(rows - 1);
+    let tx = column - x0 as f32;
+    let ty = row - y0 as f32;
+    let at = |x: usize, y: usize| {
+        energy
+            .get(x.saturating_mul(rows).saturating_add(y))
+            .copied()
+            .unwrap_or_default()
+            .clamp(0.0, 1.0)
+    };
+    let top = at(x0, y0) + (at(x1, y0) - at(x0, y0)) * tx;
+    let bottom = at(x0, y1) + (at(x1, y1) - at(x0, y1)) * tx;
+    top + (bottom - top) * ty
 }
 
 fn midi(pixels: &mut [u8], notes: &[MidiPreviewNote]) {
@@ -145,13 +160,20 @@ fn midi(pixels: &mut [u8], notes: &[MidiPreviewNote]) {
 }
 
 fn spectral_color(value: f32) -> [u8; 4] {
-    let (from, to, amount) = if value < 0.55 {
-        ([25.0, 25.0, 25.0], [0.0, 170.0, 255.0], value / 0.55)
+    let value = value.clamp(0.0, 1.0).powf(0.72);
+    let (from, to, amount) = if value < 0.28 {
+        ([22.0, 20.0, 29.0], [90.0, 32.0, 118.0], value / 0.28)
+    } else if value < 0.68 {
+        (
+            [90.0, 32.0, 118.0],
+            [0.0, 184.0, 255.0],
+            (value - 0.28) / 0.40,
+        )
     } else {
         (
-            [0.0, 170.0, 255.0],
-            [37.0, 231.0, 255.0],
-            (value - 0.55) / 0.45,
+            [0.0, 184.0, 255.0],
+            [255.0, 150.0, 52.0],
+            (value - 0.68) / 0.32,
         )
     };
     [

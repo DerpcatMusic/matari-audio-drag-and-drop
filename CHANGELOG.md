@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.1.2 - Unreleased
+
+- Route Hyprland XWayland editors through the compositor's canonical XDND bridge, preventing serial-less private Wayland sessions from leaving alternating drag gestures unfinished.
+- Render spectral drag previews with smooth high-detail sampling and a clearer multicolor energy palette.
+
 ## 0.1.1 - Unreleased
 
 - Render native drag previews as rounded, high-contrast dark cards so toolkit and desktop handoff previews remain visually consistent.

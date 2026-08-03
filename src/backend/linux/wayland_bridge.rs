@@ -65,11 +65,6 @@ impl fmt::Display for WaylandBridgeError {
 
 impl Error for WaylandBridgeError {}
 
-pub(crate) fn available() -> bool {
-    std::env::var_os("WAYLAND_DISPLAY").is_some()
-        && std::env::var_os("HYPRLAND_INSTANCE_SIGNATURE").is_some()
-}
-
 struct PreparedWaylandBridge {
     connection: Connection,
     event_queue: wayland_client::EventQueue<BridgeState>,

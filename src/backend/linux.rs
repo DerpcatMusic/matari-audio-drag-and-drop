@@ -30,7 +30,7 @@ const STATUS_ACCEPT: u32 = 1;
 pub enum X11WaylandBridge {
     /// KWin or Mutter translates the editor's canonical XDND source.
     CanonicalXdnd,
-    /// Hyprland accepts a native Wayland source without a Wayland press serial.
+    /// Legacy serial-less native Wayland compatibility route.
     HyprlandSeriallessCompat,
     /// No supported X11-source to native-Wayland bridge is known.
     Unavailable,
@@ -112,14 +112,13 @@ pub fn x11_bridge_report() -> X11BridgeReport {
             evidence: X11BridgeEvidence::None,
         };
     }
-    if wayland_bridge::available()
-        && window_manager
-            .as_deref()
-            .and_then(|name| name.get(..b"Hyprland".len()))
-            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(b"Hyprland"))
+    if window_manager
+        .as_deref()
+        .and_then(|name| name.get(..b"Hyprland".len()))
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(b"Hyprland"))
     {
         return X11BridgeReport {
-            bridge: X11WaylandBridge::HyprlandSeriallessCompat,
+            bridge: X11WaylandBridge::CanonicalXdnd,
             evidence: X11BridgeEvidence::HyprlandInstance,
         };
     }
@@ -410,8 +409,8 @@ impl PreviewWindow {
 
 /// Outbound session selected for an X11 or XWayland editor.
 ///
-/// Hyprland uses its native Wayland data-device source. Other desktops use
-/// XDND on the toolkit's X11 event queue.
+/// XWayland editors use XDND on the toolkit's X11 event queue. The compositor
+/// owns any transfer between XWayland and native Wayland clients.
 #[must_use = "the toolkit must drive this session or explicitly cancel it before teardown"]
 pub struct X11Session {
     inner: LinuxSession,
