@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.3 - Unreleased
+
+- Keep Hyprland's serial-less Wayland data-device runtime alive across XWayland plug-in drags, matching native client lifecycle and preventing per-gesture bridge teardown from stranding later drops.
+
 ## 0.1.2 - Unreleased
 
 - Route Hyprland XWayland editors through the compositor's canonical XDND bridge, preventing serial-less private Wayland sessions from leaving alternating drag gestures unfinished.

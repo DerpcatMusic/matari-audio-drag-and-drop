@@ -8,9 +8,10 @@
 use std::error::Error;
 use std::fmt;
 use std::io::Write;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock, mpsc};
 use std::thread;
+use std::time::Duration;
 
 use smithay_client_toolkit::{
     data_device_manager::{
@@ -20,7 +21,7 @@ use smithay_client_toolkit::{
         data_source::{DataSourceHandler, DragSource},
     },
     reexports::{
-        calloop::{EventLoop, LoopSignal, channel},
+        calloop::{EventLoop, channel},
         calloop_wayland_source::WaylandSource,
     },
     seat::{Capability, SeatHandler, SeatState},
@@ -68,19 +69,17 @@ impl Error for WaylandBridgeError {}
 struct PreparedWaylandBridge {
     connection: Connection,
     event_queue: wayland_client::EventQueue<BridgeState>,
+    queue: QueueHandle<BridgeState>,
+    compositor: WlCompositor,
+    manager: DataDeviceManagerState,
     seat_state: SeatState,
     shm: Shm,
     data_device: DataDevice,
-    source: DragSource,
     origin: WlSurface,
-    icon: Option<DragIcon>,
-    offers: Vec<FileDragOffer>,
 }
 
 impl PreparedWaylandBridge {
-    fn prepare(files: &FileSet) -> Result<Self, WaylandBridgeError> {
-        let offers = files.offers();
-        let preview = files.preview().cloned();
+    fn prepare() -> Result<Self, WaylandBridgeError> {
         let connection = Connection::connect_to_env()
             .map_err(|error| WaylandBridgeError::new(format!("Wayland connect failed: {error}")))?;
         let (globals, event_queue) =
@@ -102,41 +101,83 @@ impl PreparedWaylandBridge {
             .ok_or_else(|| WaylandBridgeError::new("Wayland session has no wl_seat"))?;
         let data_device = manager.get_data_device(&queue, &seat);
         let origin = compositor.create_surface(&queue, ());
-        let icon = preview
-            .as_ref()
-            .map(|preview| DragIcon::new(&compositor, &shm, &queue, preview))
-            .transpose()?;
-        let mime_types: Vec<String> = offers
-            .iter()
-            .map(|offer| offer.mime_type().to_owned())
-            .collect();
-        let source = manager.create_drag_and_drop_source(&queue, mime_types, DndAction::Copy);
-        source.start_drag(
-            &data_device,
-            &origin,
-            icon.as_ref().map(|icon| &icon.surface),
-            0,
-        );
         connection
             .flush()
             .map_err(|error| WaylandBridgeError::new(format!("Wayland flush failed: {error}")))?;
         Ok(Self {
             connection,
             event_queue,
+            queue,
+            compositor,
+            manager,
             seat_state,
             shm,
             data_device,
-            source,
             origin,
-            icon,
-            offers,
         })
     }
 }
 
-pub(super) struct WaylandBridgeSession {
+static NEXT_DRAG_ID: AtomicU64 = AtomicU64::new(1);
+static BRIDGE_RUNTIME: OnceLock<Result<BridgeRuntime, WaylandBridgeError>> = OnceLock::new();
+
+struct BridgeRuntime {
     commands: channel::Sender<Command>,
-    worker: Option<thread::JoinHandle<()>>,
+}
+
+impl BridgeRuntime {
+    fn shared() -> Result<&'static Self, WaylandBridgeError> {
+        BRIDGE_RUNTIME
+            .get_or_init(Self::launch)
+            .as_ref()
+            .map_err(Clone::clone)
+    }
+
+    fn launch() -> Result<Self, WaylandBridgeError> {
+        let prepared = PreparedWaylandBridge::prepare()?;
+        let (commands, command_source) = channel::channel();
+        let (ready_tx, ready_rx) = mpsc::sync_channel(1);
+        thread::Builder::new()
+            .name("matari-wayland-dnd".to_owned())
+            .spawn(move || {
+                let mut state = BridgeState {
+                    connection: prepared.connection.clone(),
+                    queue: prepared.queue,
+                    compositor: prepared.compositor,
+                    manager: prepared.manager,
+                    seat_state: prepared.seat_state,
+                    shm: prepared.shm,
+                    _data_device: prepared.data_device,
+                    origin: prepared.origin,
+                    active: None,
+                };
+                if run_queue(
+                    prepared.connection,
+                    prepared.event_queue,
+                    command_source,
+                    ready_tx,
+                    &mut state,
+                )
+                .is_err()
+                {
+                    state.fail_active();
+                }
+            })
+            .map_err(|error| {
+                WaylandBridgeError::new(format!("Wayland drag thread failed: {error}"))
+            })?;
+        ready_rx
+            .recv_timeout(Duration::from_secs(1))
+            .map_err(|error| {
+                WaylandBridgeError::new(format!("Wayland drag runtime failed: {error}"))
+            })??;
+        Ok(Self { commands })
+    }
+}
+
+pub(super) struct WaylandBridgeSession {
+    id: u64,
+    commands: channel::Sender<Command>,
     transfer_ready: Arc<AtomicBool>,
     terminal: Arc<AtomicBool>,
 }
@@ -146,46 +187,32 @@ impl WaylandBridgeSession {
         files: FileSet,
         reporter: SessionReporter,
     ) -> Result<Self, WaylandBridgeError> {
-        let prepared = PreparedWaylandBridge::prepare(&files)?;
+        let runtime = BridgeRuntime::shared()?;
+        let id = NEXT_DRAG_ID.fetch_add(1, Ordering::Relaxed);
         let transfer_ready = Arc::new(AtomicBool::new(false));
         let terminal = Arc::new(AtomicBool::new(false));
-        let (commands, command_source) = channel::channel();
-        let worker_ready = Arc::clone(&transfer_ready);
-        let worker_terminal = Arc::clone(&terminal);
-        let worker = thread::Builder::new()
-            .name("matari-wayland-dnd".to_owned())
-            .spawn(move || {
-                let mut state = BridgeState {
-                    seat_state: prepared.seat_state,
-                    shm: prepared.shm,
-                    _data_device: prepared.data_device,
-                    source: Some(prepared.source),
-                    _origin: prepared.origin,
-                    _icon: prepared.icon,
-                    offers: prepared.offers,
-                    reporter: WaylandSourceReporter::new(reporter),
-                    transfer_ready: worker_ready,
-                    terminal: worker_terminal,
-                    signal: None,
-                };
-                if run_queue(
-                    prepared.connection,
-                    prepared.event_queue,
-                    command_source,
-                    &mut state,
-                )
-                .is_err()
-                    && !state.is_terminal()
-                {
-                    state.fail();
-                }
+        let (started_tx, started_rx) = mpsc::sync_channel(1);
+        runtime
+            .commands
+            .send(Command::Start {
+                id,
+                files,
+                reporter,
+                transfer_ready: Arc::clone(&transfer_ready),
+                terminal: Arc::clone(&terminal),
+                started: started_tx,
             })
             .map_err(|error| {
-                WaylandBridgeError::new(format!("Wayland drag thread failed: {error}"))
+                WaylandBridgeError::new(format!("Wayland drag command failed: {error}"))
             })?;
+        started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .map_err(|error| {
+                WaylandBridgeError::new(format!("Wayland drag start failed: {error}"))
+            })??;
         Ok(WaylandBridgeSession {
-            commands,
-            worker: Some(worker),
+            id,
+            commands: runtime.commands.clone(),
             transfer_ready,
             terminal,
         })
@@ -200,21 +227,11 @@ impl WaylandBridgeSession {
     }
 
     fn signal_cancel(&self) {
-        let _ = self.commands.send(Command::Cancel);
+        let _ = self.commands.send(Command::Cancel { id: self.id });
     }
 
-    fn join_worker(&mut self) {
-        let Some(worker) = self.worker.take() else {
-            return;
-        };
-        if worker.thread().id() != thread::current().id() {
-            let _ = worker.join();
-        }
-    }
-
-    pub(super) fn cancel(mut self) {
+    pub(super) fn cancel(self) {
         self.signal_cancel();
-        self.join_worker();
     }
 }
 
@@ -222,6 +239,7 @@ fn run_queue(
     connection: Connection,
     event_queue: wayland_client::EventQueue<BridgeState>,
     command_source: channel::Channel<Command>,
+    ready: mpsc::SyncSender<Result<(), WaylandBridgeError>>,
     state: &mut BridgeState,
 ) -> Result<(), WaylandBridgeError> {
     let mut event_loop = EventLoop::try_new()
@@ -229,15 +247,28 @@ fn run_queue(
     WaylandSource::new(connection, event_queue)
         .insert(event_loop.handle())
         .map_err(|error| WaylandBridgeError::new(format!("Wayland source failed: {error}")))?;
-    state.signal = Some(event_loop.get_signal());
     event_loop
         .handle()
         .insert_source(command_source, |event, _, state| {
-            if matches!(event, channel::Event::Msg(Command::Cancel)) {
-                state.finish(LinuxOutcome::Cancelled);
+            if let channel::Event::Msg(command) = event {
+                match command {
+                    Command::Start {
+                        id,
+                        files,
+                        reporter,
+                        transfer_ready,
+                        terminal,
+                        started,
+                    } => {
+                        let result = state.start(id, files, reporter, transfer_ready, terminal);
+                        let _ = started.send(result);
+                    }
+                    Command::Cancel { id } => state.cancel(id),
+                }
             }
         })
         .map_err(|error| WaylandBridgeError::new(format!("cancel source failed: {error}")))?;
+    let _ = ready.send(Ok(()));
     event_loop
         .run(None, state, |_| {})
         .map_err(|error| WaylandBridgeError::new(format!("Wayland dispatch failed: {error}")))
@@ -258,73 +289,139 @@ impl Drop for WaylandBridgeSession {
         if !self.is_terminal() {
             self.signal_cancel();
         }
-        self.join_worker();
     }
 }
 
-#[derive(Clone, Copy, Debug)]
 enum Command {
-    Cancel,
+    Start {
+        id: u64,
+        files: FileSet,
+        reporter: SessionReporter,
+        transfer_ready: Arc<AtomicBool>,
+        terminal: Arc<AtomicBool>,
+        started: mpsc::SyncSender<Result<(), WaylandBridgeError>>,
+    },
+    Cancel {
+        id: u64,
+    },
 }
 
-struct BridgeState {
-    seat_state: SeatState,
-    shm: Shm,
-    _data_device: DataDevice,
-    source: Option<DragSource>,
-    _origin: WlSurface,
+struct ActiveDrag {
+    id: u64,
+    source: DragSource,
     _icon: Option<DragIcon>,
     offers: Vec<FileDragOffer>,
     reporter: WaylandSourceReporter,
     transfer_ready: Arc<AtomicBool>,
     terminal: Arc<AtomicBool>,
-    signal: Option<LoopSignal>,
+}
+
+struct BridgeState {
+    connection: Connection,
+    queue: QueueHandle<BridgeState>,
+    compositor: WlCompositor,
+    manager: DataDeviceManagerState,
+    seat_state: SeatState,
+    shm: Shm,
+    _data_device: DataDevice,
+    origin: WlSurface,
+    active: Option<ActiveDrag>,
 }
 
 impl BridgeState {
+    fn start(
+        &mut self,
+        id: u64,
+        files: FileSet,
+        reporter: SessionReporter,
+        transfer_ready: Arc<AtomicBool>,
+        terminal: Arc<AtomicBool>,
+    ) -> Result<(), WaylandBridgeError> {
+        if self.active.is_some() {
+            self.finish_active(LinuxOutcome::Cancelled);
+        }
+        let offers = files.offers();
+        let icon = files
+            .preview()
+            .map(|preview| DragIcon::new(&self.compositor, &self.shm, &self.queue, preview))
+            .transpose()?;
+        let source = self.manager.create_drag_and_drop_source(
+            &self.queue,
+            offers.iter().map(FileDragOffer::mime_type),
+            DndAction::Copy,
+        );
+        source.start_drag(
+            &self._data_device,
+            &self.origin,
+            icon.as_ref().map(|icon| &icon.surface),
+            0,
+        );
+        self.active = Some(ActiveDrag {
+            id,
+            source,
+            _icon: icon,
+            offers,
+            reporter: WaylandSourceReporter::new(reporter),
+            transfer_ready,
+            terminal,
+        });
+        if let Err(error) = self.connection.flush() {
+            self.fail_active();
+            return Err(WaylandBridgeError::new(format!(
+                "Wayland flush failed: {error}"
+            )));
+        }
+        Ok(())
+    }
+
     fn owns(&self, source: &WlDataSource) -> bool {
-        self.source
+        self.active
             .as_ref()
-            .is_some_and(|active| active.inner() == source)
+            .is_some_and(|active| active.source.inner() == source)
     }
 
-    fn is_terminal(&self) -> bool {
-        self.terminal.load(Ordering::Acquire)
+    fn cancel(&mut self, id: u64) {
+        if self.active.as_ref().is_some_and(|active| active.id == id) {
+            self.finish_active(LinuxOutcome::Cancelled);
+        }
     }
 
-    fn sync_transfer_ready(&self) {
-        if self.reporter.is_transfer_ready() {
-            self.transfer_ready.store(true, Ordering::Release);
+    fn sync_transfer_ready(active: &ActiveDrag) {
+        if active.reporter.is_transfer_ready() {
+            active.transfer_ready.store(true, Ordering::Release);
         }
     }
 
     fn finish(&mut self, outcome: LinuxOutcome) {
-        if self.terminal.swap(true, Ordering::AcqRel) {
+        self.finish_active(outcome);
+    }
+
+    fn finish_active(&mut self, outcome: LinuxOutcome) {
+        let Some(active) = self.active.take() else {
             return;
-        }
-        drop(self.source.take());
-        self.reporter.finish_linux(outcome);
-        if let Some(signal) = &self.signal {
-            signal.stop();
+        };
+        if !active.terminal.swap(true, Ordering::AcqRel) {
+            active.reporter.finish_linux(outcome);
         }
     }
 
-    fn fail(&mut self) {
-        if self.terminal.swap(true, Ordering::AcqRel) {
+    fn fail_active(&mut self) {
+        let Some(active) = self.active.take() else {
             return;
-        }
-        drop(self.source.take());
-        self.reporter.finish(Outcome::Failed(SessionFailure {
-            stage: FailureStage::Transfer,
-            kind: FailureKind::NativeFailure,
-        }));
-        if let Some(signal) = &self.signal {
-            signal.stop();
+        };
+        if !active.terminal.swap(true, Ordering::AcqRel) {
+            active.reporter.finish(Outcome::Failed(SessionFailure {
+                stage: FailureStage::Transfer,
+                kind: FailureKind::NativeFailure,
+            }));
         }
     }
 
     fn send_payload(&mut self, mime: &str, mut pipe: WritePipe) {
-        let Some(offer) = self.offers.iter().find(|offer| offer.mime_type() == mime) else {
+        let Some(active) = self.active.as_mut() else {
+            return;
+        };
+        let Some(offer) = active.offers.iter().find(|offer| offer.mime_type() == mime) else {
             return;
         };
         if pipe
@@ -332,8 +429,8 @@ impl BridgeState {
             .and_then(|()| pipe.flush())
             .is_ok()
         {
-            self.reporter.bridge_payload_transferred();
-            self.sync_transfer_ready();
+            active.reporter.bridge_payload_transferred();
+            Self::sync_transfer_ready(active);
         }
     }
 }
@@ -560,9 +657,11 @@ impl DataSourceHandler for BridgeState {
         _queue: &QueueHandle<Self>,
         source: &WlDataSource,
     ) {
-        if self.owns(source) {
-            self.reporter.drop_performed();
-            self.sync_transfer_ready();
+        if self.owns(source)
+            && let Some(active) = self.active.as_mut()
+        {
+            active.reporter.drop_performed();
+            Self::sync_transfer_ready(active);
         }
     }
 
