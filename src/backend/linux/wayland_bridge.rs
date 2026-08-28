@@ -178,6 +178,7 @@ impl BridgeRuntime {
 pub(super) struct WaylandBridgeSession {
     id: u64,
     commands: channel::Sender<Command>,
+    reporter: SessionReporter,
     transfer_ready: Arc<AtomicBool>,
     terminal: Arc<AtomicBool>,
 }
@@ -197,7 +198,7 @@ impl WaylandBridgeSession {
             .send(Command::Start {
                 id,
                 files,
-                reporter,
+                reporter: reporter.clone(),
                 transfer_ready: Arc::clone(&transfer_ready),
                 terminal: Arc::clone(&terminal),
                 started: started_tx,
@@ -213,6 +214,7 @@ impl WaylandBridgeSession {
         Ok(WaylandBridgeSession {
             id,
             commands: runtime.commands.clone(),
+            reporter,
             transfer_ready,
             terminal,
         })
@@ -230,8 +232,19 @@ impl WaylandBridgeSession {
         let _ = self.commands.send(Command::Cancel { id: self.id });
     }
 
-    pub(super) fn cancel(self) {
+    fn finish_cancelled(&self) {
+        if !self.terminal.swap(true, Ordering::AcqRel) {
+            self.reporter.finish_linux(LinuxOutcome::Cancelled);
+        }
+    }
+
+    pub(super) fn cancel_stale(&self) {
+        self.finish_cancelled();
         self.signal_cancel();
+    }
+
+    pub(super) fn cancel(self) {
+        self.cancel_stale();
     }
 }
 
@@ -287,7 +300,7 @@ impl fmt::Debug for WaylandBridgeSession {
 impl Drop for WaylandBridgeSession {
     fn drop(&mut self) {
         if !self.is_terminal() {
-            self.signal_cancel();
+            self.cancel_stale();
         }
     }
 }

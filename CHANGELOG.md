@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.1.5 - Unreleased
+
+- Route compositor-bridged file drops through XWayland host windows to embedded plug-in editors without adding another native event loop.
+- Retire a compositor-stuck Wayland drag when the next pointer gesture begins so one failed destination cannot block later drags.
+
 ## 0.1.4 - Unreleased
 
 - Wait for Hyprland to process native Wayland drag setup before returning control to an XWayland editor, preventing pointer release from overtaking compositor setup.

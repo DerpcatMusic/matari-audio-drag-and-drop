@@ -23,9 +23,9 @@ use crate::{NativeProtocol, SourceContext};
 mod linux;
 #[cfg(all(target_family = "unix", not(target_os = "macos")))]
 pub use linux::{
-    X11BridgeEvidence, X11BridgeReport, X11PointerEvent, X11Session, X11SessionError,
-    X11SessionStatus, X11StartError, X11WaylandBridge, x11_bridge_report, x11_outbound_protocol,
-    x11_wayland_bridge,
+    X11BridgeEvidence, X11BridgeReport, X11DropRouter, X11PointerEvent, X11Session,
+    X11SessionError, X11SessionStatus, X11StartError, X11WaylandBridge, x11_bridge_report,
+    x11_outbound_protocol, x11_wayland_bridge,
 };
 
 #[cfg(target_os = "macos")]

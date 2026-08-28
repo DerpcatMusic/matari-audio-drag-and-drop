@@ -1,8 +1,11 @@
 use std::error::Error;
 use std::fmt;
 
+mod drop_router;
 mod mime;
 mod wayland_bridge;
+
+pub use drop_router::X11DropRouter;
 
 use crate::{
     DragOrigin, FileDragPayloadData, FileSet, LinuxOutcome, LinuxRejector, NativeProtocol,
@@ -420,14 +423,21 @@ pub struct X11Session {
 
 enum LinuxSession {
     Xdnd(Box<XdndSession>),
-    Wayland(WaylandBridgeSession),
+    Wayland {
+        session: WaylandBridgeSession,
+        released: bool,
+    },
 }
 
 impl fmt::Debug for X11Session {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match &self.inner {
             LinuxSession::Xdnd(session) => session.fmt(formatter),
-            LinuxSession::Wayland(session) => session.fmt(formatter),
+            LinuxSession::Wayland { session, released } => formatter
+                .debug_struct("X11WaylandSession")
+                .field("session", session)
+                .field("released", released)
+                .finish(),
         }
     }
 }
@@ -460,7 +470,10 @@ impl X11Session {
             }
             return WaylandBridgeSession::start(files, reporter)
                 .map(|session| Self {
-                    inner: LinuxSession::Wayland(session),
+                    inner: LinuxSession::Wayland {
+                        session,
+                        released: false,
+                    },
                     route,
                 })
                 .map_err(|error| X11SessionError::new(error.to_string()));
@@ -499,11 +512,20 @@ impl X11Session {
     ) -> Result<X11SessionStatus, X11SessionError> {
         match &mut self.inner {
             LinuxSession::Xdnd(session) => session.handle_event(conn, event),
-            LinuxSession::Wayland(session) => Ok(if session.is_terminal() {
-                X11SessionStatus::Finished
-            } else {
-                X11SessionStatus::Active
-            }),
+            LinuxSession::Wayland { session, released } => {
+                if session.is_terminal() {
+                    return Ok(X11SessionStatus::Finished);
+                }
+                if matches!(event, Event::ButtonRelease(event) if event.detail == 1) {
+                    *released = true;
+                } else if *released
+                    && matches!(event, Event::ButtonPress(event) if event.detail == 1)
+                {
+                    session.cancel_stale();
+                    return Ok(X11SessionStatus::Finished);
+                }
+                Ok(X11SessionStatus::Active)
+            }
         }
     }
 
@@ -514,7 +536,9 @@ impl X11Session {
     pub fn transfer_complete(&self) -> bool {
         match &self.inner {
             LinuxSession::Xdnd(session) => session.transfer_complete(),
-            LinuxSession::Wayland(session) => session.transfer_complete() || session.is_terminal(),
+            LinuxSession::Wayland { session, .. } => {
+                session.transfer_complete() || session.is_terminal()
+            }
         }
     }
 
@@ -522,7 +546,7 @@ impl X11Session {
     pub fn cancel<C: Connection>(self, conn: &C) -> Result<(), X11SessionError> {
         match self.inner {
             LinuxSession::Xdnd(session) => (*session).cancel(conn),
-            LinuxSession::Wayland(session) => {
+            LinuxSession::Wayland { session, .. } => {
                 session.cancel();
                 Ok(())
             }
@@ -533,7 +557,7 @@ impl X11Session {
     pub fn supersede<C: Connection>(self, conn: &C) -> Result<(), X11SessionError> {
         match self.inner {
             LinuxSession::Xdnd(session) => (*session).supersede(conn),
-            LinuxSession::Wayland(session) => {
+            LinuxSession::Wayland { session, .. } => {
                 session.cancel();
                 Ok(())
             }
