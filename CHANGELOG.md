@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.6 - Unreleased
+
+- Preserve the X11 source gesture through Hyprland's native Wayland bridge so a completed XWayland drop always releases the editor and later drags keep working.
+
 ## 0.1.5 - Unreleased
 
 - Route compositor-bridged file drops through XWayland host windows to embedded plug-in editors without adding another native event loop.

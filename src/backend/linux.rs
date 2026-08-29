@@ -468,15 +468,20 @@ impl X11Session {
                     "serial-less native Wayland is unavailable",
                 ));
             }
-            return WaylandBridgeSession::start(files, reporter)
-                .map(|session| Self {
+            capture_pointer(conn, source_window, press.time)?;
+            return match WaylandBridgeSession::start(files, reporter) {
+                Ok(session) => Ok(Self {
                     inner: LinuxSession::Wayland {
                         session,
                         released: false,
                     },
                     route,
-                })
-                .map_err(|error| X11SessionError::new(error.to_string()));
+                }),
+                Err(error) => {
+                    let _ = release_pointer(conn, press.time);
+                    Err(X11SessionError::new(error.to_string()))
+                }
+            };
         }
         if route.protocol != NativeProtocol::Xdnd
             || !matches!(
@@ -513,10 +518,10 @@ impl X11Session {
         match &mut self.inner {
             LinuxSession::Xdnd(session) => session.handle_event(conn, event),
             LinuxSession::Wayland { session, released } => {
-                if session.is_terminal() {
-                    return Ok(X11SessionStatus::Finished);
-                }
-                if matches!(event, Event::ButtonRelease(event) if event.detail == 1) {
+                if let Event::ButtonRelease(event) = event
+                    && event.detail == 1
+                {
+                    release_pointer(conn, event.time)?;
                     *released = true;
                 } else if *released
                     && matches!(event, Event::ButtonPress(event) if event.detail == 1)
@@ -524,7 +529,11 @@ impl X11Session {
                     session.cancel_stale();
                     return Ok(X11SessionStatus::Finished);
                 }
-                Ok(X11SessionStatus::Active)
+                Ok(if session.is_terminal() && *released {
+                    X11SessionStatus::Finished
+                } else {
+                    X11SessionStatus::Active
+                })
             }
         }
     }
@@ -546,9 +555,14 @@ impl X11Session {
     pub fn cancel<C: Connection>(self, conn: &C) -> Result<(), X11SessionError> {
         match self.inner {
             LinuxSession::Xdnd(session) => (*session).cancel(conn),
-            LinuxSession::Wayland { session, .. } => {
+            LinuxSession::Wayland { session, released } => {
+                let result = if released {
+                    Ok(())
+                } else {
+                    release_pointer(conn, CURRENT_TIME)
+                };
                 session.cancel();
-                Ok(())
+                result
             }
         }
     }
@@ -557,12 +571,50 @@ impl X11Session {
     pub fn supersede<C: Connection>(self, conn: &C) -> Result<(), X11SessionError> {
         match self.inner {
             LinuxSession::Xdnd(session) => (*session).supersede(conn),
-            LinuxSession::Wayland { session, .. } => {
+            LinuxSession::Wayland { session, released } => {
+                let result = if released {
+                    Ok(())
+                } else {
+                    release_pointer(conn, CURRENT_TIME)
+                };
                 session.cancel();
-                Ok(())
+                result
             }
         }
     }
+}
+
+fn capture_pointer<C: Connection>(
+    conn: &C,
+    source_window: XWindow,
+    time: u32,
+) -> Result<(), X11SessionError> {
+    let status = conn
+        .grab_pointer(
+            true,
+            source_window,
+            EventMask::POINTER_MOTION | EventMask::BUTTON_RELEASE,
+            GrabMode::ASYNC,
+            GrabMode::ASYNC,
+            x11rb::NONE,
+            x11rb::NONE,
+            time,
+        )
+        .map_err(x11_error)?
+        .reply()
+        .map_err(x11_error)?
+        .status;
+    if status != GrabStatus::SUCCESS {
+        return Err(X11SessionError::new(format!(
+            "could not capture the drag pointer: {status:?}"
+        )));
+    }
+    Ok(())
+}
+
+fn release_pointer<C: Connection>(conn: &C, time: u32) -> Result<(), X11SessionError> {
+    conn.ungrab_pointer(time).map_err(x11_error)?;
+    conn.flush().map_err(x11_error)
 }
 
 fn x11_source_window(origin: DragOrigin<'_>) -> Result<XWindow, X11StartError> {
@@ -631,33 +683,10 @@ impl XdndSession {
         if owner != source_window {
             return Err(X11SessionError::new("could not own XdndSelection"));
         }
-        let grab_status = match conn
-            .grab_pointer(
-                true,
-                source_window,
-                EventMask::POINTER_MOTION | EventMask::BUTTON_RELEASE,
-                GrabMode::ASYNC,
-                GrabMode::ASYNC,
-                x11rb::NONE,
-                x11rb::NONE,
-                press.time,
-            )
-            .map_err(x11_error)
-            .and_then(|cookie| cookie.reply().map_err(x11_error))
-        {
-            Ok(reply) => reply.status,
-            Err(error) => {
-                let _ = conn.set_selection_owner(x11rb::NONE, atoms.xdnd_selection, press.time);
-                let _ = conn.flush();
-                return Err(error);
-            }
-        };
-        if grab_status != GrabStatus::SUCCESS {
+        if let Err(error) = capture_pointer(conn, source_window, press.time) {
             let _ = conn.set_selection_owner(x11rb::NONE, atoms.xdnd_selection, press.time);
             let _ = conn.flush();
-            return Err(X11SessionError::new(format!(
-                "could not capture the drag pointer: {grab_status:?}"
-            )));
+            return Err(error);
         }
 
         let preview = preview.and_then(|preview| {
