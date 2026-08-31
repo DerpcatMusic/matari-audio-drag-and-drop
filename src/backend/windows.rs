@@ -1,16 +1,22 @@
-use std::mem::{ManuallyDrop, size_of};
+use std::mem::{ManuallyDrop, size_of, zeroed};
 use std::os::windows::ffi::OsStrExt;
 use std::path::PathBuf;
 use std::ptr;
 
 use raw_window_handle::RawWindowHandle;
 use windows::Win32::Foundation::{
-    DRAGDROP_S_CANCEL, DRAGDROP_S_DROP, DRAGDROP_S_USEDEFAULTCURSORS, DV_E_FORMATETC, E_NOTIMPL,
-    GlobalFree, HGLOBAL, HWND, OLE_E_ADVISENOTSUPPORTED, POINT, RPC_E_CHANGED_MODE,
+    COLORREF, DRAGDROP_S_CANCEL, DRAGDROP_S_DROP, DRAGDROP_S_USEDEFAULTCURSORS, DV_E_FORMATETC,
+    E_NOTIMPL, GlobalFree, HGLOBAL, HWND, OLE_E_ADVISENOTSUPPORTED, POINT, RPC_E_CHANGED_MODE,
+    SIZE,
+};
+use windows::Win32::Graphics::Gdi::{
+    BI_RGB, BITMAPINFO, BITMAPINFOHEADER, CreateDIBSection, DIB_RGB_COLORS, DeleteObject, HBITMAP,
+    HDC,
 };
 use windows::Win32::System::Com::{
-    DATADIR_GET, DVASPECT_CONTENT, FORMATETC, IAdviseSink, IDataObject, IDataObject_Impl,
-    IEnumFORMATETC, IEnumSTATDATA, STGMEDIUM, STGMEDIUM_0, TYMED_HGLOBAL,
+    CLSCTX_INPROC_SERVER, CoCreateInstance, DATADIR_GET, DVASPECT_CONTENT, FORMATETC, IAdviseSink,
+    IDataObject, IDataObject_Impl, IEnumFORMATETC, IEnumSTATDATA, STGMEDIUM, STGMEDIUM_0,
+    TYMED_HGLOBAL,
 };
 use windows::Win32::System::DataExchange::RegisterClipboardFormatW;
 use windows::Win32::System::Memory::{GHND, GlobalAlloc, GlobalLock, GlobalUnlock};
@@ -20,21 +26,22 @@ use windows::Win32::System::Ole::{
 };
 use windows::Win32::System::SystemServices::{MK_LBUTTON, MODIFIERKEYS_FLAGS};
 use windows::Win32::UI::Shell::{
-    CFSTR_FILENAMEW, CFSTR_PREFERREDDROPEFFECT, DROPFILES, SHCreateStdEnumFmtEtc,
+    CFSTR_FILENAMEW, CFSTR_PREFERREDDROPEFFECT, CLSID_DragDropHelper, DROPFILES, IDragSourceHelper,
+    SHCreateStdEnumFmtEtc, SHDRAGIMAGE,
 };
 use windows::core::implement;
 use windows_core::{BOOL, HRESULT, IUnknown, PCWSTR, Ref, Result};
 
 use super::ExternalDragPayload;
 use super::{DragWindow, ExternalDragError};
-use crate::{FailureKind, FailureStage, Outcome, SessionFailure, SessionReporter};
+use crate::{DragPreview, FailureKind, FailureStage, Outcome, SessionFailure, SessionReporter};
 
 pub(super) fn start_external_file_drag(
     window: DragWindow<'_>,
     payload: ExternalDragPayload,
     reporter: Option<SessionReporter>,
 ) -> std::result::Result<(), ExternalDragError> {
-    let ExternalDragPayload { paths } = payload;
+    let ExternalDragPayload { paths, preview } = payload;
 
     if paths.is_empty() {
         return Err(ExternalDragError::EmptyPayload);
@@ -55,6 +62,9 @@ pub(super) fn start_external_file_drag(
     let data_object: IDataObject = FileDataObject::new(paths)?.into();
     let drop_source: IDropSource = FileDropSource.into();
     let mut effect = DROPEFFECT(0);
+    let _drag_bitmap = preview
+        .as_ref()
+        .and_then(|preview| attach_drag_image(&data_object, preview).ok());
     // SAFETY: OLE is initialized on this GUI thread, both COM interfaces remain
     // alive for the call, and `effect` is a writable `DROPEFFECT`.
     unsafe {
@@ -84,6 +94,113 @@ pub(super) fn start_external_file_drag(
         }
     }
     Ok(())
+}
+
+struct DragBitmapGuard(HBITMAP);
+
+impl Drop for DragBitmapGuard {
+    fn drop(&mut self) {
+        // SAFETY: This guard uniquely owns the bitmap created by
+        // `create_drag_bitmap`, and OLE has finished using it before drop.
+        unsafe {
+            let _ = DeleteObject(self.0.into());
+        }
+    }
+}
+
+fn attach_drag_image(
+    data_object: &IDataObject,
+    preview: &DragPreview,
+) -> std::result::Result<DragBitmapGuard, String> {
+    let pixels = crate::preview::render(preview);
+    let bitmap = DragBitmapGuard(create_drag_bitmap(
+        &pixels,
+        crate::preview::WIDTH,
+        crate::preview::HEIGHT,
+    )?);
+    // SAFETY: `CLSID_DragDropHelper` identifies the in-process shell drag helper.
+    let helper: IDragSourceHelper = unsafe {
+        CoCreateInstance(&CLSID_DragDropHelper, None, CLSCTX_INPROC_SERVER)
+            .map_err(|error| format!("IDragSourceHelper create failed: {error}"))?
+    };
+    let image = SHDRAGIMAGE {
+        sizeDragImage: SIZE {
+            cx: crate::preview::WIDTH as i32,
+            cy: crate::preview::HEIGHT as i32,
+        },
+        ptOffset: POINT {
+            x: crate::preview::WIDTH as i32 / 2,
+            y: crate::preview::HEIGHT as i32 / 2,
+        },
+        hbmpDragImage: bitmap.0,
+        crColorKey: COLORREF(0),
+    };
+    // SAFETY: `image` and `data_object` remain valid for the call. The bitmap
+    // guard remains alive through the synchronous `DoDragDrop` operation.
+    unsafe {
+        helper
+            .InitializeFromBitmap(&image, data_object)
+            .map_err(|error| format!("InitializeFromBitmap failed: {error}"))?;
+    }
+    Ok(bitmap)
+}
+
+fn create_drag_bitmap(
+    rgba: &[u8],
+    width: usize,
+    height: usize,
+) -> std::result::Result<HBITMAP, String> {
+    // SAFETY: Zero is a valid initial state for `BITMAPINFO`; the required
+    // header fields are initialized below before the GDI call.
+    let mut info: BITMAPINFO = unsafe { zeroed() };
+    info.bmiHeader = BITMAPINFOHEADER {
+        biSize: size_of::<BITMAPINFOHEADER>() as u32,
+        biWidth: width as i32,
+        biHeight: height as i32,
+        biPlanes: 1,
+        biBitCount: 32,
+        biCompression: BI_RGB.0,
+        biSizeImage: 0,
+        biXPelsPerMeter: 0,
+        biYPelsPerMeter: 0,
+        biClrUsed: 0,
+        biClrImportant: 0,
+    };
+    let mut bits = ptr::null_mut();
+    // SAFETY: `info` is initialized for a 32-bit DIB and `bits` is a valid out
+    // pointer. The returned bitmap is owned by `DragBitmapGuard`.
+    let bitmap = unsafe {
+        CreateDIBSection(
+            Some(HDC::default()),
+            &info,
+            DIB_RGB_COLORS,
+            &mut bits,
+            None,
+            0,
+        )
+        .map_err(|error| format!("CreateDIBSection failed: {error}"))?
+    };
+    if bits.is_null() {
+        // SAFETY: GDI returned the live bitmap above, but no writable storage.
+        let _ = unsafe { DeleteObject(bitmap.into()) };
+        return Err("CreateDIBSection returned null bits".into());
+    }
+
+    let stride = width * 4;
+    // SAFETY: A 32-bit DIB exposes exactly `stride * height` writable bytes.
+    let destination = unsafe { std::slice::from_raw_parts_mut(bits.cast::<u8>(), stride * height) };
+    for y in 0..height {
+        let source_row = &rgba[y * stride..(y + 1) * stride];
+        let destination_row = &mut destination[(height - 1 - y) * stride..(height - y) * stride];
+        for x in 0..width {
+            let offset = x * 4;
+            destination_row[offset] = source_row[offset + 2];
+            destination_row[offset + 1] = source_row[offset + 1];
+            destination_row[offset + 2] = source_row[offset];
+            destination_row[offset + 3] = source_row[offset + 3];
+        }
+    }
+    Ok(bitmap)
 }
 
 struct OleDragApartment;

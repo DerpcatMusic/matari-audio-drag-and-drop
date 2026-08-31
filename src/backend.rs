@@ -12,6 +12,7 @@ use raw_window_handle::WindowHandle;
 #[cfg(not(all(target_family = "unix", not(target_os = "macos"))))]
 pub(crate) struct ExternalDragPayload {
     pub(crate) paths: Vec<std::path::PathBuf>,
+    pub(crate) preview: Option<crate::DragPreview>,
 }
 #[cfg(not(all(target_family = "unix", not(target_os = "macos"))))]
 use crate::platform::DragBackendKind;
@@ -138,9 +139,8 @@ pub(crate) fn start_reported_file_drag(
             )));
         }
     };
-    let payload = ExternalDragPayload {
-        paths: files.into_paths(),
-    };
+    let (paths, preview) = files.into_parts();
+    let payload = ExternalDragPayload { paths, preview };
     platform_start_file_drag(window, payload, origin.appkit_event(), Some(reporter))
         .map_err(|error| NativeStartError::new(error.to_string()))?;
     Ok(route)

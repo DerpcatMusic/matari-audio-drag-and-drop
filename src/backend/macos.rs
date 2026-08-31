@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use std::ptr;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -6,8 +7,8 @@ use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2::{AnyThread, DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send};
 use objc2_app_kit::{
-    NSDragOperation, NSDraggingContext, NSDraggingItem, NSDraggingSession, NSDraggingSource,
-    NSEvent, NSView,
+    NSBitmapImageRep, NSDeviceRGBColorSpace, NSDragOperation, NSDraggingContext, NSDraggingItem,
+    NSDraggingSession, NSDraggingSource, NSEvent, NSImage, NSImageRep, NSView,
 };
 use objc2_foundation::{
     NSArray, NSObject, NSObjectProtocol, NSPoint, NSRect, NSSize, NSString, NSURL,
@@ -16,7 +17,7 @@ use raw_window_handle::RawWindowHandle;
 
 use super::ExternalDragPayload;
 use super::{DragWindow, ExternalDragError};
-use crate::{Outcome, SessionReporter};
+use crate::{DragPreview, Outcome, SessionReporter};
 
 struct DragSourceIvars {
     reporter: Mutex<Option<SessionReporter>>,
@@ -101,7 +102,7 @@ pub(super) fn start_external_file_drag(
     appkit_event: Option<std::ptr::NonNull<std::ffi::c_void>>,
     reporter: Option<SessionReporter>,
 ) -> Result<(), ExternalDragError> {
-    let ExternalDragPayload { paths } = payload;
+    let ExternalDragPayload { paths, preview } = payload;
 
     if paths.is_empty() {
         return Err(ExternalDragError::EmptyPayload);
@@ -133,7 +134,7 @@ pub(super) fn start_external_file_drag(
     // SAFETY: `RawWindowHandle::AppKit` guarantees `ns_view` identifies the
     // live `NSView` borrowed through `window`; `mtm` proves main-thread access.
     let view = unsafe { &*ns_view };
-    start_drag_from_view(view, event, &paths, reporter, mtm);
+    start_drag_from_view(view, event, &paths, preview.as_ref(), reporter, mtm);
     Ok(())
 }
 
@@ -141,11 +142,13 @@ fn start_drag_from_view(
     view: &NSView,
     event: &NSEvent,
     paths: &[PathBuf],
+    preview: Option<&DragPreview>,
     reporter: Option<SessionReporter>,
     mtm: MainThreadMarker,
 ) {
     let location = event.locationInWindow();
-    let items = dragging_items(paths, location);
+    let image = preview.map(ns_image_from_preview);
+    let items = dragging_items(paths, location, image.as_ref());
     let item_refs = items.iter().map(|item| &**item).collect::<Vec<_>>();
     let item_array = NSArray::from_slice(&item_refs);
     let source = MatariExternalDragSource::new(mtm, reporter);
@@ -155,9 +158,13 @@ fn start_drag_from_view(
     let _self_owned_until_terminal = Retained::into_raw(source);
 }
 
-fn dragging_items(paths: &[PathBuf], location: NSPoint) -> Vec<Retained<NSDraggingItem>> {
-    let width = 1.0;
-    let height = 1.0;
+fn dragging_items(
+    paths: &[PathBuf],
+    location: NSPoint,
+    image: Option<&Retained<NSImage>>,
+) -> Vec<Retained<NSDraggingItem>> {
+    let width = crate::preview::WIDTH as f64;
+    let height = crate::preview::HEIGHT as f64;
     paths
         .iter()
         .enumerate()
@@ -170,10 +177,13 @@ fn dragging_items(paths: &[PathBuf], location: NSPoint) -> Vec<Retained<NSDraggi
             let dragging_item =
                 NSDraggingItem::initWithPasteboardWriter(NSDraggingItem::alloc(), writer);
             let offset = index as f64 * 4.0;
-            // SAFETY: `dragging_item` is fully initialized, the finite frame is
-            // valid for the duration of the call, and AppKit permits no custom
-            // contents image.
+            // SAFETY: `dragging_item` is fully initialized and the image, when
+            // present, remains retained while AppKit copies the drag contents.
             unsafe {
+                let contents = image.map(|image| {
+                    let image: &NSImage = image;
+                    image as &objc2::runtime::AnyObject
+                });
                 dragging_item.setDraggingFrame_contents(
                     NSRect::new(
                         NSPoint::new(
@@ -182,12 +192,49 @@ fn dragging_items(paths: &[PathBuf], location: NSPoint) -> Vec<Retained<NSDraggi
                         ),
                         NSSize::new(width, height),
                     ),
-                    None,
+                    contents,
                 );
             }
             dragging_item
         })
         .collect()
+}
+
+fn ns_image_from_preview(preview: &DragPreview) -> Retained<NSImage> {
+    let pixels = crate::preview::render(preview);
+    let width = crate::preview::WIDTH;
+    let height = crate::preview::HEIGHT;
+    let image = NSImage::initWithSize(NSImage::alloc(), NSSize::new(width as f64, height as f64));
+    // SAFETY: The geometry and 8-bit RGBA layout describe the initialized
+    // `pixels` buffer copied below.
+    let Some(bitmap) = (unsafe {
+        NSBitmapImageRep::initWithBitmapDataPlanes_pixelsWide_pixelsHigh_bitsPerSample_samplesPerPixel_hasAlpha_isPlanar_colorSpaceName_bytesPerRow_bitsPerPixel(
+            NSBitmapImageRep::alloc(),
+            ptr::null_mut(),
+            width as isize,
+            height as isize,
+            8,
+            4,
+            true,
+            false,
+            NSDeviceRGBColorSpace,
+            (width * 4) as isize,
+            32,
+        )
+    }) else {
+        return image;
+    };
+    let destination = bitmap.bitmapData();
+    if !destination.is_null() {
+        // SAFETY: AppKit allocated at least `width * height * 4` bytes for the
+        // bitmap layout above, and `pixels` has exactly that length.
+        unsafe {
+            ptr::copy_nonoverlapping(pixels.as_ptr(), destination, pixels.len());
+        }
+    }
+    let representation: &NSImageRep = bitmap.as_ref();
+    image.addRepresentation(representation);
+    image
 }
 
 fn validate_paths(paths: &[PathBuf]) -> Result<(), String> {

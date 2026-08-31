@@ -66,10 +66,14 @@ version = "0.3"
 default-features = false
 features = [
     "NSApplication",
+    "NSBitmapImageRep",
     "NSDragging",
     "NSDraggingItem",
     "NSDraggingSession",
     "NSEvent",
+    "NSGraphics",
+    "NSImage",
+    "NSImageRep",
     "NSPasteboard",
     "NSPasteboardItem",
     "NSResponder",
