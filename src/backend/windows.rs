@@ -150,12 +150,16 @@ impl SourceDragImage {
                 0,
             )
         };
-        if list.is_invalid() || unsafe { ImageList_Add(list, bitmap.0, None) } < 0 {
-            if !list.is_invalid() {
-                let _ = unsafe { ImageList_Destroy(Some(list)) };
-            }
+        if list.is_invalid() {
             return Err(PreviewAttachError::new(PreviewFailureStage::Helper, None));
         }
+        // SAFETY: Both the image list and bitmap are live; the list copies the bitmap.
+        if unsafe { ImageList_Add(list, bitmap.0, None) } < 0 {
+            // SAFETY: This branch still uniquely owns the live image list.
+            let _ = unsafe { ImageList_Destroy(Some(list)) };
+            return Err(PreviewAttachError::new(PreviewFailureStage::Helper, None));
+        }
+        // SAFETY: The list contains image zero and the hotspot is within its bounds.
         if !unsafe {
             ImageList_BeginDrag(
                 list,
@@ -166,6 +170,7 @@ impl SourceDragImage {
         }
         .as_bool()
         {
+            // SAFETY: BeginDrag failed, so this branch still uniquely owns the list.
             let _ = unsafe { ImageList_Destroy(Some(list)) };
             return Err(PreviewAttachError::new(PreviewFailureStage::Attach, None));
         }
@@ -184,6 +189,7 @@ impl SourceDragImage {
 
     fn move_to_cursor(&self) {
         let mut cursor = POINT::default();
+        // SAFETY: The drag image is active and `cursor` is writable.
         unsafe {
             if GetCursorPos(&mut cursor).is_ok() {
                 let _ = ImageList_DragMove(cursor.x, cursor.y);
@@ -394,9 +400,12 @@ impl IDataObject_Impl for FileDataObject_Impl {
             Some(ShellDragFormat::Hdrop) => self.hdrop_medium(),
             Some(ShellDragFormat::PreferredDropEffect(_)) => self.preferred_drop_effect_medium(),
             Some(ShellDragFormat::FileNameW(_)) => self.filenamew_medium(),
-            None => unsafe { pformatetcin.as_ref() }
-                .ok_or_else(|| windows_core::Error::from(DV_E_FORMATETC))
-                .and_then(|format| self.stored_medium(format)),
+            None => {
+                // SAFETY: COM requires this pointer to be null or readable for the call.
+                unsafe { pformatetcin.as_ref() }
+                    .ok_or_else(|| windows_core::Error::from(DV_E_FORMATETC))
+                    .and_then(|format| self.stored_medium(format))
+            }
         }
     }
 
@@ -414,6 +423,7 @@ impl IDataObject_Impl for FileDataObject_Impl {
                 .iter()
                 .any(|stored| stored.matches(format))
         });
+        // SAFETY: COM requires this pointer to be null or readable for the call.
         if unsafe { self.requested_format(pformatetc) }.is_some() || stored {
             HRESULT(0)
         } else {
@@ -567,6 +577,8 @@ impl StoredMedium {
 
     fn duplicate_medium(&self) -> Result<STGMEDIUM> {
         Self::duplicate(&self.format, &self.medium).map(|copy| {
+            // SAFETY: `copy` owns this initialized medium; it is forgotten below
+            // so ownership transfers to the returned value exactly once.
             let medium = unsafe { ptr::read(&copy.medium) };
             std::mem::forget(copy);
             medium
