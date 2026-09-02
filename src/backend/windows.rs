@@ -154,7 +154,7 @@ fn attach_drag_image(
             y: crate::preview::HEIGHT as i32 / 2,
         },
         hbmpDragImage: bitmap.0,
-        crColorKey: COLORREF(0),
+        crColorKey: COLORREF(u32::MAX),
     };
     // SAFETY: `image` and `data_object` remain valid for the call. The bitmap
     // guard remains alive through the synchronous `DoDragDrop` operation.
@@ -228,10 +228,11 @@ fn create_drag_bitmap(
         let destination_row = &mut destination[(height - 1 - y) * stride..(height - y) * stride];
         for x in 0..width {
             let offset = x * 4;
-            destination_row[offset] = source_row[offset + 2];
-            destination_row[offset + 1] = source_row[offset + 1];
-            destination_row[offset + 2] = source_row[offset];
-            destination_row[offset + 3] = source_row[offset + 3];
+            let alpha = source_row[offset + 3] as u32;
+            destination_row[offset] = ((source_row[offset + 2] as u32 * alpha) / 255) as u8;
+            destination_row[offset + 1] = ((source_row[offset + 1] as u32 * alpha) / 255) as u8;
+            destination_row[offset + 2] = ((source_row[offset] as u32 * alpha) / 255) as u8;
+            destination_row[offset + 3] = alpha as u8;
         }
     }
     Ok(bitmap)
@@ -411,12 +412,7 @@ impl IDataObject_Impl for FileDataObject_Impl {
         else {
             return Err(DV_E_FORMATETC.into());
         };
-        if !format.ptd.is_null()
-            || format.dwAspect != DVASPECT_CONTENT.0
-            || format.lindex != -1
-            || medium.tymed != TYMED_HGLOBAL.0 as u32
-            || (format.tymed & TYMED_HGLOBAL.0 as u32) == 0
-        {
+        if medium.tymed != TYMED_HGLOBAL.0 as u32 || (format.tymed & TYMED_HGLOBAL.0 as u32) == 0 {
             return Err(DV_E_FORMATETC.into());
         }
         // SAFETY: `medium.tymed` is TYMED_HGLOBAL, so this union field is live.
@@ -512,9 +508,7 @@ impl StoredHGlobal {
     }
 
     fn matches(&self, format: &FORMATETC) -> bool {
-        format.ptd.is_null()
-            && (format.tymed & TYMED_HGLOBAL.0 as u32) != 0
-            && self.same_format(format)
+        (format.tymed & TYMED_HGLOBAL.0 as u32) != 0 && self.same_format(format)
     }
 
     fn format(&self) -> FORMATETC {
