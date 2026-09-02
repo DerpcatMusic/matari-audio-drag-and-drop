@@ -66,26 +66,23 @@ pub(super) fn start_external_file_drag(
     let data_object: IDataObject = FileDataObject::new(paths)?.into();
     let drop_source: IDropSource = FileDropSource.into();
     let mut effect = DROPEFFECT(0);
-    let _drag_bitmap =
-        preview
-            .as_ref()
-            .and_then(|preview| match attach_drag_image(&data_object, preview) {
-                Ok(bitmap) => {
-                    if let Some(reporter) = &reporter {
-                        reporter.preview(PreviewStatus::Attached);
-                    }
-                    Some(bitmap)
+    if let Some(preview) = &preview {
+        match attach_drag_image(&data_object, preview) {
+            Ok(()) => {
+                if let Some(reporter) = &reporter {
+                    reporter.preview(PreviewStatus::Attached);
                 }
-                Err(error) => {
-                    if let Some(reporter) = &reporter {
-                        reporter.preview(PreviewStatus::Unavailable {
-                            stage: error.stage,
-                            native_code: error.native_code,
-                        });
-                    }
-                    None
+            }
+            Err(error) => {
+                if let Some(reporter) = &reporter {
+                    reporter.preview(PreviewStatus::Unavailable {
+                        stage: error.stage,
+                        native_code: error.native_code,
+                    });
                 }
-            });
+            }
+        }
+    }
     // SAFETY: OLE is initialized on this GUI thread, both COM interfaces remain
     // alive for the call, and `effect` is a writable `DROPEFFECT`.
     unsafe {
@@ -132,7 +129,7 @@ impl Drop for DragBitmapGuard {
 fn attach_drag_image(
     data_object: &IDataObject,
     preview: &DragPreview,
-) -> std::result::Result<DragBitmapGuard, PreviewAttachError> {
+) -> std::result::Result<(), PreviewAttachError> {
     let pixels = crate::preview::render(preview);
     let bitmap = DragBitmapGuard(
         create_drag_bitmap(&pixels, crate::preview::WIDTH, crate::preview::HEIGHT)
@@ -156,8 +153,8 @@ fn attach_drag_image(
         hbmpDragImage: bitmap.0,
         crColorKey: COLORREF(u32::MAX),
     };
-    // SAFETY: `image` and `data_object` remain valid for the call. The bitmap
-    // guard remains alive through the synchronous `DoDragDrop` operation.
+    // SAFETY: `image` and `data_object` remain valid for the call. On success
+    // the shell helper takes ownership of the bitmap.
     unsafe {
         helper
             .InitializeFromBitmap(&image, data_object)
@@ -165,7 +162,8 @@ fn attach_drag_image(
                 PreviewAttachError::new(PreviewFailureStage::Attach, Some(error.code().0))
             })?;
     }
-    Ok(bitmap)
+    std::mem::forget(bitmap);
+    Ok(())
 }
 
 struct PreviewAttachError {
@@ -228,11 +226,10 @@ fn create_drag_bitmap(
         let destination_row = &mut destination[(height - 1 - y) * stride..(height - y) * stride];
         for x in 0..width {
             let offset = x * 4;
-            let alpha = source_row[offset + 3] as u32;
-            destination_row[offset] = ((source_row[offset + 2] as u32 * alpha) / 255) as u8;
-            destination_row[offset + 1] = ((source_row[offset + 1] as u32 * alpha) / 255) as u8;
-            destination_row[offset + 2] = ((source_row[offset] as u32 * alpha) / 255) as u8;
-            destination_row[offset + 3] = alpha as u8;
+            destination_row[offset] = source_row[offset + 2];
+            destination_row[offset + 1] = source_row[offset + 1];
+            destination_row[offset + 2] = source_row[offset];
+            destination_row[offset + 3] = source_row[offset + 3];
         }
     }
     Ok(bitmap)
@@ -417,7 +414,12 @@ impl IDataObject_Impl for FileDataObject_Impl {
         }
         // SAFETY: `medium.tymed` is TYMED_HGLOBAL, so this union field is live.
         let source = unsafe { medium.u.hGlobal };
-        let stored = StoredHGlobal::duplicate(format, source)?;
+        let takes_plain_hglobal = frelease.as_bool() && medium.pUnkForRelease.is_none();
+        let stored = if takes_plain_hglobal {
+            StoredHGlobal::take(format, source)
+        } else {
+            StoredHGlobal::duplicate(format, source)?
+        };
         let mut formats = self
             .stored
             .lock()
@@ -428,7 +430,7 @@ impl IDataObject_Impl for FileDataObject_Impl {
             formats.push(stored);
         }
         drop(formats);
-        if frelease.as_bool() {
+        if frelease.as_bool() && !takes_plain_hglobal {
             // SAFETY: Successful SetData with `frelease` transfers ownership.
             let mut transferred = unsafe { ptr::read(pmedium) };
             unsafe { windows::Win32::System::Ole::ReleaseStgMedium(&mut transferred) };
@@ -485,6 +487,15 @@ struct StoredHGlobal {
 }
 
 impl StoredHGlobal {
+    fn take(format: &FORMATETC, source: HGLOBAL) -> Self {
+        Self {
+            clipboard_format: format.cfFormat,
+            aspect: format.dwAspect,
+            index: format.lindex,
+            handle: source.0 as usize,
+        }
+    }
+
     fn duplicate(format: &FORMATETC, source: HGLOBAL) -> Result<Self> {
         // SAFETY: OLE duplicates the live HGLOBAL into an independently owned
         // allocation suitable for the same clipboard format.
