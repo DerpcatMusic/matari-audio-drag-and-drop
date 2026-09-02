@@ -32,7 +32,7 @@ use windows::Win32::UI::Controls::{
 use windows::Win32::UI::Shell::{
     CFSTR_FILENAMEW, CFSTR_PREFERREDDROPEFFECT, DROPFILES, SHCreateStdEnumFmtEtc,
 };
-use windows::Win32::UI::WindowsAndMessaging::GetCursorPos;
+use windows::Win32::UI::WindowsAndMessaging::{GetCursorPos, GetDesktopWindow};
 use windows::core::implement;
 use windows_core::{BOOL, HRESULT, IUnknown, PCWSTR, Ref, Result};
 
@@ -131,7 +131,7 @@ impl Drop for DragBitmapGuard {
     }
 }
 
-struct SourceDragImage(HIMAGELIST);
+struct SourceDragImage(HIMAGELIST, HWND);
 
 impl SourceDragImage {
     fn new(preview: &DragPreview) -> std::result::Result<Self, PreviewAttachError> {
@@ -170,11 +170,16 @@ impl SourceDragImage {
             return Err(PreviewAttachError::new(PreviewFailureStage::Attach, None));
         }
         let mut cursor = POINT::default();
+        // SAFETY: The desktop window is process-independent and remains valid
+        // for the synchronous drag operation.
+        let lock_window = unsafe { GetDesktopWindow() };
+        // SAFETY: The drag image is active, the cursor pointer is writable,
+        // and Win32 requires a real owner for stable drawing and coordinates.
         unsafe {
             let _ = GetCursorPos(&mut cursor);
-            let _ = ImageList_DragEnter(HWND::default(), cursor.x, cursor.y);
+            let _ = ImageList_DragEnter(lock_window, cursor.x, cursor.y);
         }
-        Ok(Self(list))
+        Ok(Self(list, lock_window))
     }
 
     fn move_to_cursor(&self) {
@@ -189,8 +194,10 @@ impl SourceDragImage {
 
 impl Drop for SourceDragImage {
     fn drop(&mut self) {
+        // SAFETY: This ends the active drag image on the same owning window
+        // before destroying its uniquely owned image list.
         unsafe {
-            let _ = ImageList_DragLeave(HWND::default());
+            let _ = ImageList_DragLeave(self.1);
             ImageList_EndDrag();
             let _ = ImageList_Destroy(Some(self.0));
         }

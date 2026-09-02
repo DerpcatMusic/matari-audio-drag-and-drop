@@ -3,7 +3,7 @@
 ## 0.1.6 - Unreleased
 
 - Preserve the X11 source gesture through Hyprland's native Wayland bridge so a completed XWayland drop always releases the editor and later drags keep working.
-- Keep the Windows source thumbnail visible across DAW drop targets that do not implement the Shell target helper.
+- Keep the Windows source thumbnail visible and anchored across DAW drop targets that do not implement the Shell target helper.
 
 ## 0.1.5 - Unreleased
 
