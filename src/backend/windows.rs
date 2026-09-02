@@ -409,7 +409,7 @@ impl IDataObject_Impl for FileDataObject_Impl {
         else {
             return Err(DV_E_FORMATETC.into());
         };
-        if medium.tymed != TYMED_HGLOBAL.0 as u32 || (format.tymed & TYMED_HGLOBAL.0 as u32) == 0 {
+        if medium.tymed != TYMED_HGLOBAL.0 as u32 {
             return Err(DV_E_FORMATETC.into());
         }
         // SAFETY: `medium.tymed` is TYMED_HGLOBAL, so this union field is live.
