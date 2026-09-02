@@ -277,7 +277,7 @@ fn validate_paths(paths: &[PathBuf]) -> std::result::Result<(), String> {
 struct FileDataObject {
     paths: Vec<PathBuf>,
     formats: ShellDragFormats,
-    stored: Mutex<Vec<StoredHGlobal>>,
+    stored: Mutex<Vec<StoredMedium>>,
 }
 
 impl FileDataObject {
@@ -347,7 +347,7 @@ impl FileDataObject {
         stored
             .iter()
             .find(|stored| stored.matches(format))
-            .map(StoredHGlobal::duplicate_medium)
+            .map(StoredMedium::duplicate_medium)
             .transpose()?
             .ok_or_else(|| DV_E_FORMATETC.into())
     }
@@ -409,16 +409,12 @@ impl IDataObject_Impl for FileDataObject_Impl {
         else {
             return Err(DV_E_FORMATETC.into());
         };
-        if medium.tymed != TYMED_HGLOBAL.0 as u32 {
-            return Err(DV_E_FORMATETC.into());
-        }
-        // SAFETY: `medium.tymed` is TYMED_HGLOBAL, so this union field is live.
-        let source = unsafe { medium.u.hGlobal };
-        let takes_plain_hglobal = frelease.as_bool() && medium.pUnkForRelease.is_none();
-        let stored = if takes_plain_hglobal {
-            StoredHGlobal::take(format, source)
+        let stored = if frelease.as_bool() {
+            // SAFETY: `frelease` transfers ownership of the entire medium,
+            // including any custom `pUnkForRelease`, to this data object.
+            StoredMedium::take(format, unsafe { ptr::read(pmedium) })
         } else {
-            StoredHGlobal::duplicate(format, source)?
+            StoredMedium::duplicate(format, medium)?
         };
         let mut formats = self
             .stored
@@ -428,12 +424,6 @@ impl IDataObject_Impl for FileDataObject_Impl {
             *existing = stored;
         } else {
             formats.push(stored);
-        }
-        drop(formats);
-        if frelease.as_bool() && !takes_plain_hglobal {
-            // SAFETY: Successful SetData with `frelease` transfers ownership.
-            let mut transferred = unsafe { ptr::read(pmedium) };
-            unsafe { windows::Win32::System::Ole::ReleaseStgMedium(&mut transferred) };
         }
         Ok(())
     }
@@ -450,7 +440,7 @@ impl IDataObject_Impl for FileDataObject_Impl {
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner())
                         .iter()
-                        .map(StoredHGlobal::format),
+                        .map(StoredMedium::format),
                 )
                 .collect::<Vec<_>>();
             // SAFETY: `formats` is initialized and valid for the call;
@@ -479,78 +469,83 @@ impl IDataObject_Impl for FileDataObject_Impl {
     }
 }
 
-struct StoredHGlobal {
-    clipboard_format: u16,
-    aspect: u32,
-    index: i32,
-    handle: usize,
+struct StoredMedium {
+    format: FORMATETC,
+    medium: STGMEDIUM,
 }
 
-impl StoredHGlobal {
-    fn take(format: &FORMATETC, source: HGLOBAL) -> Self {
+impl StoredMedium {
+    fn take(format: &FORMATETC, medium: STGMEDIUM) -> Self {
         Self {
-            clipboard_format: format.cfFormat,
-            aspect: format.dwAspect,
-            index: format.lindex,
-            handle: source.0 as usize,
+            format: FORMATETC {
+                ptd: ptr::null_mut(),
+                ..*format
+            },
+            medium,
         }
     }
 
-    fn duplicate(format: &FORMATETC, source: HGLOBAL) -> Result<Self> {
+    fn duplicate(format: &FORMATETC, source: &STGMEDIUM) -> Result<Self> {
+        if source.tymed != TYMED_HGLOBAL.0 as u32 {
+            return Err(DV_E_FORMATETC.into());
+        }
+        // SAFETY: `source.tymed` is TYMED_HGLOBAL, so this union field is live.
+        let source_handle = unsafe { source.u.hGlobal };
         // SAFETY: OLE duplicates the live HGLOBAL into an independently owned
         // allocation suitable for the same clipboard format.
-        let duplicate =
-            unsafe { OleDuplicateData(HANDLE(source.0), CLIPBOARD_FORMAT(format.cfFormat), GHND) };
+        let duplicate = unsafe {
+            OleDuplicateData(
+                HANDLE(source_handle.0),
+                CLIPBOARD_FORMAT(format.cfFormat),
+                GHND,
+            )
+        };
         if duplicate.0.is_null() {
             return Err(windows_core::Error::from_thread());
         }
-        Ok(Self {
-            clipboard_format: format.cfFormat,
-            aspect: format.dwAspect,
-            index: format.lindex,
-            handle: duplicate.0 as usize,
-        })
+        Ok(Self::take(
+            format,
+            STGMEDIUM {
+                tymed: TYMED_HGLOBAL.0 as u32,
+                u: STGMEDIUM_0 {
+                    hGlobal: HGLOBAL(duplicate.0),
+                },
+                pUnkForRelease: ManuallyDrop::new(None::<IUnknown>),
+            },
+        ))
     }
 
     fn same_format(&self, format: &FORMATETC) -> bool {
-        self.clipboard_format == format.cfFormat
-            && self.aspect == format.dwAspect
-            && self.index == format.lindex
+        self.format.cfFormat == format.cfFormat
+            && self.format.dwAspect == format.dwAspect
+            && self.format.lindex == format.lindex
     }
 
     fn matches(&self, format: &FORMATETC) -> bool {
-        (format.tymed & TYMED_HGLOBAL.0 as u32) != 0 && self.same_format(format)
+        (format.tymed & self.medium.tymed) != 0 && self.same_format(format)
     }
 
     fn format(&self) -> FORMATETC {
         FORMATETC {
-            cfFormat: self.clipboard_format,
             ptd: ptr::null_mut(),
-            dwAspect: self.aspect,
-            lindex: self.index,
-            tymed: TYMED_HGLOBAL.0 as u32,
+            tymed: self.medium.tymed,
+            ..self.format
         }
     }
 
     fn duplicate_medium(&self) -> Result<STGMEDIUM> {
-        Self::duplicate(&self.format(), HGLOBAL(self.handle as *mut _)).map(|copy| {
-            let handle = copy.handle;
+        Self::duplicate(&self.format, &self.medium).map(|copy| {
+            let medium = unsafe { ptr::read(&copy.medium) };
             std::mem::forget(copy);
-            STGMEDIUM {
-                tymed: TYMED_HGLOBAL.0 as u32,
-                u: STGMEDIUM_0 {
-                    hGlobal: HGLOBAL(handle as *mut _),
-                },
-                pUnkForRelease: ManuallyDrop::new(None::<IUnknown>),
-            }
+            medium
         })
     }
 }
 
-impl Drop for StoredHGlobal {
+impl Drop for StoredMedium {
     fn drop(&mut self) {
-        // SAFETY: This value exclusively owns the duplicated allocation.
-        let _ = unsafe { GlobalFree(Some(HGLOBAL(self.handle as *mut _))) };
+        // SAFETY: This value owns the complete medium and its release policy.
+        unsafe { windows::Win32::System::Ole::ReleaseStgMedium(&mut self.medium) };
     }
 }
 
