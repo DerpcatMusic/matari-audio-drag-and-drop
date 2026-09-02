@@ -9,7 +9,7 @@ pub use drop_router::X11DropRouter;
 
 use crate::{
     DragOrigin, FileDragPayloadData, FileSet, LinuxOutcome, LinuxRejector, NativeProtocol,
-    SessionReporter, SessionRoute, SourceContext,
+    PreviewFailureStage, PreviewStatus, SessionReporter, SessionRoute, SourceContext,
 };
 use mime::MimeTargets;
 use raw_window_handle::RawWindowHandle;
@@ -690,7 +690,19 @@ impl XdndSession {
         }
 
         let preview = preview.and_then(|preview| {
-            PreviewWindow::new(conn, press.root, press.root_x, press.root_y, &preview).ok()
+            match PreviewWindow::new(conn, press.root, press.root_x, press.root_y, &preview) {
+                Ok(window) => {
+                    reporter.preview(PreviewStatus::Attached);
+                    Some(window)
+                }
+                Err(_) => {
+                    reporter.preview(PreviewStatus::Unavailable {
+                        stage: PreviewFailureStage::Attach,
+                        native_code: None,
+                    });
+                    None
+                }
+            }
         });
         let mut session = Self {
             atoms,
@@ -871,6 +883,10 @@ impl XdndSession {
             .is_some_and(|preview| preview.move_to(conn, root_x, root_y).is_err());
         if failed && let Some(preview) = self.preview.take() {
             preview.destroy(conn);
+            self.reporter.preview(PreviewStatus::Unavailable {
+                stage: PreviewFailureStage::Move,
+                native_code: None,
+            });
         }
     }
 
@@ -881,6 +897,10 @@ impl XdndSession {
             .is_some_and(|preview| preview.draw(conn).is_err());
         if failed && let Some(preview) = self.preview.take() {
             preview.destroy(conn);
+            self.reporter.preview(PreviewStatus::Unavailable {
+                stage: PreviewFailureStage::Redraw,
+                native_code: None,
+            });
         }
     }
 

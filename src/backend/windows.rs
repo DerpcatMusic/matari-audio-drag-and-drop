@@ -2,39 +2,46 @@ use std::mem::{ManuallyDrop, size_of, zeroed};
 use std::os::windows::ffi::OsStrExt;
 use std::path::PathBuf;
 use std::ptr;
+use std::sync::Mutex;
 
 use raw_window_handle::RawWindowHandle;
 use windows::Win32::Foundation::{
-    COLORREF, DRAGDROP_S_CANCEL, DRAGDROP_S_DROP, DRAGDROP_S_USEDEFAULTCURSORS, DV_E_FORMATETC,
-    E_NOTIMPL, GlobalFree, HGLOBAL, HWND, OLE_E_ADVISENOTSUPPORTED, POINT, RPC_E_CHANGED_MODE,
-    SIZE,
+    DRAGDROP_S_CANCEL, DRAGDROP_S_DROP, DRAGDROP_S_USEDEFAULTCURSORS, DV_E_FORMATETC, E_NOTIMPL,
+    GlobalFree, HANDLE, HGLOBAL, HWND, OLE_E_ADVISENOTSUPPORTED, POINT, RPC_E_CHANGED_MODE,
 };
 use windows::Win32::Graphics::Gdi::{
     BI_RGB, BITMAPINFO, BITMAPINFOHEADER, CreateDIBSection, DIB_RGB_COLORS, DeleteObject, HBITMAP,
     HDC,
 };
 use windows::Win32::System::Com::{
-    CLSCTX_INPROC_SERVER, CoCreateInstance, DATADIR_GET, DVASPECT_CONTENT, FORMATETC, IAdviseSink,
-    IDataObject, IDataObject_Impl, IEnumFORMATETC, IEnumSTATDATA, STGMEDIUM, STGMEDIUM_0,
-    TYMED_HGLOBAL,
+    DATADIR_GET, DVASPECT_CONTENT, FORMATETC, IAdviseSink, IDataObject, IDataObject_Impl,
+    IEnumFORMATETC, IEnumSTATDATA, STGMEDIUM, STGMEDIUM_0, TYMED_HGLOBAL,
 };
 use windows::Win32::System::DataExchange::RegisterClipboardFormatW;
 use windows::Win32::System::Memory::{GHND, GlobalAlloc, GlobalLock, GlobalUnlock};
 use windows::Win32::System::Ole::{
-    CF_HDROP, DROPEFFECT, DROPEFFECT_COPY, DoDragDrop, IDropSource, IDropSource_Impl,
-    OleInitialize, OleUninitialize,
+    CF_HDROP, CLIPBOARD_FORMAT, DROPEFFECT, DROPEFFECT_COPY, DoDragDrop, IDropSource,
+    IDropSource_Impl, OleDuplicateData, OleInitialize, OleUninitialize,
 };
 use windows::Win32::System::SystemServices::{MK_LBUTTON, MODIFIERKEYS_FLAGS};
-use windows::Win32::UI::Shell::{
-    CFSTR_FILENAMEW, CFSTR_PREFERREDDROPEFFECT, CLSID_DragDropHelper, DROPFILES, IDragSourceHelper,
-    SHCreateStdEnumFmtEtc, SHDRAGIMAGE,
+use windows::Win32::UI::Controls::{
+    HIMAGELIST, ILC_COLOR32, ImageList_Add, ImageList_BeginDrag, ImageList_Create,
+    ImageList_Destroy, ImageList_DragEnter, ImageList_DragLeave, ImageList_DragMove,
+    ImageList_EndDrag,
 };
+use windows::Win32::UI::Shell::{
+    CFSTR_FILENAMEW, CFSTR_PREFERREDDROPEFFECT, DROPFILES, SHCreateStdEnumFmtEtc,
+};
+use windows::Win32::UI::WindowsAndMessaging::{GetCursorPos, GetDesktopWindow};
 use windows::core::implement;
 use windows_core::{BOOL, HRESULT, IUnknown, PCWSTR, Ref, Result};
 
 use super::ExternalDragPayload;
 use super::{DragWindow, ExternalDragError};
-use crate::{DragPreview, FailureKind, FailureStage, Outcome, SessionFailure, SessionReporter};
+use crate::{
+    DragPreview, FailureKind, FailureStage, Outcome, PreviewFailureStage, PreviewStatus,
+    SessionFailure, SessionReporter,
+};
 
 pub(super) fn start_external_file_drag(
     window: DragWindow<'_>,
@@ -60,11 +67,27 @@ pub(super) fn start_external_file_drag(
 
     let _ole = OleDragApartment::initialize()?;
     let data_object: IDataObject = FileDataObject::new(paths)?.into();
-    let drop_source: IDropSource = FileDropSource.into();
-    let mut effect = DROPEFFECT(0);
-    let _drag_bitmap = preview
+    let drag_image = preview
         .as_ref()
-        .and_then(|preview| attach_drag_image(&data_object, preview).ok());
+        .and_then(|preview| match SourceDragImage::new(preview) {
+            Ok(image) => {
+                if let Some(reporter) = &reporter {
+                    reporter.preview(PreviewStatus::Attached);
+                }
+                Some(image)
+            }
+            Err(error) => {
+                if let Some(reporter) = &reporter {
+                    reporter.preview(PreviewStatus::Unavailable {
+                        stage: error.stage,
+                        native_code: error.native_code,
+                    });
+                }
+                None
+            }
+        });
+    let drop_source: IDropSource = FileDropSource { drag_image }.into();
+    let mut effect = DROPEFFECT(0);
     // SAFETY: OLE is initialized on this GUI thread, both COM interfaces remain
     // alive for the call, and `effect` is a writable `DROPEFFECT`.
     unsafe {
@@ -108,41 +131,94 @@ impl Drop for DragBitmapGuard {
     }
 }
 
-fn attach_drag_image(
-    data_object: &IDataObject,
-    preview: &DragPreview,
-) -> std::result::Result<DragBitmapGuard, String> {
-    let pixels = crate::preview::render(preview);
-    let bitmap = DragBitmapGuard(create_drag_bitmap(
-        &pixels,
-        crate::preview::WIDTH,
-        crate::preview::HEIGHT,
-    )?);
-    // SAFETY: `CLSID_DragDropHelper` identifies the in-process shell drag helper.
-    let helper: IDragSourceHelper = unsafe {
-        CoCreateInstance(&CLSID_DragDropHelper, None, CLSCTX_INPROC_SERVER)
-            .map_err(|error| format!("IDragSourceHelper create failed: {error}"))?
-    };
-    let image = SHDRAGIMAGE {
-        sizeDragImage: SIZE {
-            cx: crate::preview::WIDTH as i32,
-            cy: crate::preview::HEIGHT as i32,
-        },
-        ptOffset: POINT {
-            x: crate::preview::WIDTH as i32 / 2,
-            y: crate::preview::HEIGHT as i32 / 2,
-        },
-        hbmpDragImage: bitmap.0,
-        crColorKey: COLORREF(0),
-    };
-    // SAFETY: `image` and `data_object` remain valid for the call. The bitmap
-    // guard remains alive through the synchronous `DoDragDrop` operation.
-    unsafe {
-        helper
-            .InitializeFromBitmap(&image, data_object)
-            .map_err(|error| format!("InitializeFromBitmap failed: {error}"))?;
+struct SourceDragImage(HIMAGELIST, HWND);
+
+impl SourceDragImage {
+    fn new(preview: &DragPreview) -> std::result::Result<Self, PreviewAttachError> {
+        let pixels = crate::preview::render(preview);
+        let bitmap = DragBitmapGuard(
+            create_drag_bitmap(&pixels, crate::preview::WIDTH, crate::preview::HEIGHT)
+                .map_err(|_| PreviewAttachError::new(PreviewFailureStage::Bitmap, None))?,
+        );
+        // SAFETY: The image list copies the live bitmap before the bitmap guard is dropped.
+        let list = unsafe {
+            ImageList_Create(
+                crate::preview::WIDTH as i32,
+                crate::preview::HEIGHT as i32,
+                ILC_COLOR32,
+                1,
+                0,
+            )
+        };
+        if list.is_invalid() {
+            return Err(PreviewAttachError::new(PreviewFailureStage::Helper, None));
+        }
+        // SAFETY: Both the image list and bitmap are live; the list copies the bitmap.
+        if unsafe { ImageList_Add(list, bitmap.0, None) } < 0 {
+            // SAFETY: This branch still uniquely owns the live image list.
+            let _ = unsafe { ImageList_Destroy(Some(list)) };
+            return Err(PreviewAttachError::new(PreviewFailureStage::Helper, None));
+        }
+        // SAFETY: The list contains image zero and the hotspot is within its bounds.
+        if !unsafe {
+            ImageList_BeginDrag(
+                list,
+                0,
+                crate::preview::WIDTH as i32 / 2,
+                crate::preview::HEIGHT as i32 / 2,
+            )
+        }
+        .as_bool()
+        {
+            // SAFETY: BeginDrag failed, so this branch still uniquely owns the list.
+            let _ = unsafe { ImageList_Destroy(Some(list)) };
+            return Err(PreviewAttachError::new(PreviewFailureStage::Attach, None));
+        }
+        let mut cursor = POINT::default();
+        // SAFETY: The desktop window is process-independent and remains valid
+        // for the synchronous drag operation.
+        let lock_window = unsafe { GetDesktopWindow() };
+        // SAFETY: The drag image is active, the cursor pointer is writable,
+        // and Win32 requires a real owner for stable drawing and coordinates.
+        unsafe {
+            let _ = GetCursorPos(&mut cursor);
+            let _ = ImageList_DragEnter(lock_window, cursor.x, cursor.y);
+        }
+        Ok(Self(list, lock_window))
     }
-    Ok(bitmap)
+
+    fn move_to_cursor(&self) {
+        let mut cursor = POINT::default();
+        // SAFETY: The drag image is active and `cursor` is writable.
+        unsafe {
+            if GetCursorPos(&mut cursor).is_ok() {
+                let _ = ImageList_DragMove(cursor.x, cursor.y);
+            }
+        }
+    }
+}
+
+impl Drop for SourceDragImage {
+    fn drop(&mut self) {
+        // SAFETY: This ends the active drag image on the same owning window
+        // before destroying its uniquely owned image list.
+        unsafe {
+            let _ = ImageList_DragLeave(self.1);
+            ImageList_EndDrag();
+            let _ = ImageList_Destroy(Some(self.0));
+        }
+    }
+}
+
+struct PreviewAttachError {
+    stage: PreviewFailureStage,
+    native_code: Option<i32>,
+}
+
+impl PreviewAttachError {
+    fn new(stage: PreviewFailureStage, native_code: Option<i32>) -> Self {
+        Self { stage, native_code }
+    }
 }
 
 fn create_drag_bitmap(
@@ -192,13 +268,7 @@ fn create_drag_bitmap(
     for y in 0..height {
         let source_row = &rgba[y * stride..(y + 1) * stride];
         let destination_row = &mut destination[(height - 1 - y) * stride..(height - y) * stride];
-        for x in 0..width {
-            let offset = x * 4;
-            destination_row[offset] = source_row[offset + 2];
-            destination_row[offset + 1] = source_row[offset + 1];
-            destination_row[offset + 2] = source_row[offset];
-            destination_row[offset + 3] = source_row[offset + 3];
-        }
+        destination_row.copy_from_slice(source_row);
     }
     Ok(bitmap)
 }
@@ -245,6 +315,7 @@ fn validate_paths(paths: &[PathBuf]) -> std::result::Result<(), String> {
 struct FileDataObject {
     paths: Vec<PathBuf>,
     formats: ShellDragFormats,
+    stored: Mutex<Vec<StoredMedium>>,
 }
 
 impl FileDataObject {
@@ -252,6 +323,7 @@ impl FileDataObject {
         Ok(Self {
             paths,
             formats: ShellDragFormats::new()?,
+            stored: Mutex::new(Vec::new()),
         })
     }
 
@@ -304,6 +376,19 @@ impl FileDataObject {
         let wide = path.as_os_str().encode_wide().collect::<Vec<_>>();
         Ok(build_wide_string_hglobal(&wide)?.into_medium())
     }
+
+    fn stored_medium(&self, format: &FORMATETC) -> Result<STGMEDIUM> {
+        let stored = self
+            .stored
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        stored
+            .iter()
+            .find(|stored| stored.matches(format))
+            .map(StoredMedium::duplicate_medium)
+            .transpose()?
+            .ok_or_else(|| DV_E_FORMATETC.into())
+    }
 }
 
 #[allow(non_snake_case)]
@@ -315,7 +400,12 @@ impl IDataObject_Impl for FileDataObject_Impl {
             Some(ShellDragFormat::Hdrop) => self.hdrop_medium(),
             Some(ShellDragFormat::PreferredDropEffect(_)) => self.preferred_drop_effect_medium(),
             Some(ShellDragFormat::FileNameW(_)) => self.filenamew_medium(),
-            None => Err(DV_E_FORMATETC.into()),
+            None => {
+                // SAFETY: COM requires this pointer to be null or readable for the call.
+                unsafe { pformatetcin.as_ref() }
+                    .ok_or_else(|| windows_core::Error::from(DV_E_FORMATETC))
+                    .and_then(|format| self.stored_medium(format))
+            }
         }
     }
 
@@ -326,7 +416,15 @@ impl IDataObject_Impl for FileDataObject_Impl {
     fn QueryGetData(&self, pformatetc: *const FORMATETC) -> HRESULT {
         // SAFETY: COM requires `pformatetc` to be null or a readable
         // `FORMATETC` for the duration of `QueryGetData`.
-        if unsafe { self.requested_format(pformatetc) }.is_some() {
+        let stored = unsafe { pformatetc.as_ref() }.is_some_and(|format| {
+            self.stored
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .iter()
+                .any(|stored| stored.matches(format))
+        });
+        // SAFETY: COM requires this pointer to be null or readable for the call.
+        if unsafe { self.requested_format(pformatetc) }.is_some() || stored {
             HRESULT(0)
         } else {
             DV_E_FORMATETC
@@ -343,11 +441,33 @@ impl IDataObject_Impl for FileDataObject_Impl {
 
     fn SetData(
         &self,
-        _pformatetc: *const FORMATETC,
-        _pmedium: *const STGMEDIUM,
-        _frelease: BOOL,
+        pformatetc: *const FORMATETC,
+        pmedium: *const STGMEDIUM,
+        frelease: BOOL,
     ) -> Result<()> {
-        Err(E_NOTIMPL.into())
+        // SAFETY: COM requires both pointers to remain readable for this call.
+        let (Some(format), Some(medium)) =
+            (unsafe { pformatetc.as_ref() }, unsafe { pmedium.as_ref() })
+        else {
+            return Err(DV_E_FORMATETC.into());
+        };
+        let stored = if frelease.as_bool() {
+            // SAFETY: `frelease` transfers ownership of the entire medium,
+            // including any custom `pUnkForRelease`, to this data object.
+            StoredMedium::take(format, unsafe { ptr::read(pmedium) })
+        } else {
+            StoredMedium::duplicate(format, medium)?
+        };
+        let mut formats = self
+            .stored
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(existing) = formats.iter_mut().find(|item| item.same_format(format)) {
+            *existing = stored;
+        } else {
+            formats.push(stored);
+        }
+        Ok(())
     }
 
     fn EnumFormatEtc(&self, dwdirection: u32) -> Result<IEnumFORMATETC> {
@@ -357,6 +477,13 @@ impl IDataObject_Impl for FileDataObject_Impl {
                 .formats()
                 .into_iter()
                 .map(|format| FileDataObject::format(format.clipboard_format()))
+                .chain(
+                    self.stored
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .iter()
+                        .map(StoredMedium::format),
+                )
                 .collect::<Vec<_>>();
             // SAFETY: `formats` is initialized and valid for the call;
             // `SHCreateStdEnumFmtEtc` copies the entries into the enumerator.
@@ -381,6 +508,88 @@ impl IDataObject_Impl for FileDataObject_Impl {
 
     fn EnumDAdvise(&self) -> Result<IEnumSTATDATA> {
         Err(OLE_E_ADVISENOTSUPPORTED.into())
+    }
+}
+
+struct StoredMedium {
+    format: FORMATETC,
+    medium: STGMEDIUM,
+}
+
+impl StoredMedium {
+    fn take(format: &FORMATETC, medium: STGMEDIUM) -> Self {
+        Self {
+            format: FORMATETC {
+                ptd: ptr::null_mut(),
+                ..*format
+            },
+            medium,
+        }
+    }
+
+    fn duplicate(format: &FORMATETC, source: &STGMEDIUM) -> Result<Self> {
+        if source.tymed != TYMED_HGLOBAL.0 as u32 {
+            return Err(DV_E_FORMATETC.into());
+        }
+        // SAFETY: `source.tymed` is TYMED_HGLOBAL, so this union field is live.
+        let source_handle = unsafe { source.u.hGlobal };
+        // SAFETY: OLE duplicates the live HGLOBAL into an independently owned
+        // allocation suitable for the same clipboard format.
+        let duplicate = unsafe {
+            OleDuplicateData(
+                HANDLE(source_handle.0),
+                CLIPBOARD_FORMAT(format.cfFormat),
+                GHND,
+            )
+        };
+        if duplicate.0.is_null() {
+            return Err(windows_core::Error::from_thread());
+        }
+        Ok(Self::take(
+            format,
+            STGMEDIUM {
+                tymed: TYMED_HGLOBAL.0 as u32,
+                u: STGMEDIUM_0 {
+                    hGlobal: HGLOBAL(duplicate.0),
+                },
+                pUnkForRelease: ManuallyDrop::new(None::<IUnknown>),
+            },
+        ))
+    }
+
+    fn same_format(&self, format: &FORMATETC) -> bool {
+        self.format.cfFormat == format.cfFormat
+            && self.format.dwAspect == format.dwAspect
+            && self.format.lindex == format.lindex
+    }
+
+    fn matches(&self, format: &FORMATETC) -> bool {
+        (format.tymed & self.medium.tymed) != 0 && self.same_format(format)
+    }
+
+    fn format(&self) -> FORMATETC {
+        FORMATETC {
+            ptd: ptr::null_mut(),
+            tymed: self.medium.tymed,
+            ..self.format
+        }
+    }
+
+    fn duplicate_medium(&self) -> Result<STGMEDIUM> {
+        Self::duplicate(&self.format, &self.medium).map(|copy| {
+            // SAFETY: `copy` owns this initialized medium; it is forgotten below
+            // so ownership transfers to the returned value exactly once.
+            let medium = unsafe { ptr::read(&copy.medium) };
+            std::mem::forget(copy);
+            medium
+        })
+    }
+}
+
+impl Drop for StoredMedium {
+    fn drop(&mut self) {
+        // SAFETY: This value owns the complete medium and its release policy.
+        unsafe { windows::Win32::System::Ole::ReleaseStgMedium(&mut self.medium) };
     }
 }
 
@@ -439,11 +648,16 @@ fn registered_clipboard_format(name: PCWSTR) -> Option<u16> {
 }
 
 #[implement(IDropSource)]
-struct FileDropSource;
+struct FileDropSource {
+    drag_image: Option<SourceDragImage>,
+}
 
 #[allow(non_snake_case)]
 impl IDropSource_Impl for FileDropSource_Impl {
     fn QueryContinueDrag(&self, fescapepressed: BOOL, grfkeystate: MODIFIERKEYS_FLAGS) -> HRESULT {
+        if let Some(image) = &self.drag_image {
+            image.move_to_cursor();
+        }
         if fescapepressed.as_bool() {
             DRAGDROP_S_CANCEL
         } else if (grfkeystate.0 & MK_LBUTTON.0) == 0 {

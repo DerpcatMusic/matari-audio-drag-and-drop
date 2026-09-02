@@ -298,6 +298,35 @@ pub struct SessionFailure {
     pub kind: FailureKind,
 }
 
+/// Native drag-preview state.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PreviewStatus {
+    /// The native drag protocol accepted the preview.
+    Attached,
+    /// The file drag continues without a preview.
+    Unavailable {
+        /// Stable failing operation.
+        stage: PreviewFailureStage,
+        /// Native status code when the platform exposes one.
+        native_code: Option<i32>,
+    },
+}
+
+/// Stable drag-preview failure stage.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PreviewFailureStage {
+    /// Native image allocation failed.
+    Bitmap,
+    /// Native drag-image helper creation failed.
+    Helper,
+    /// The native protocol rejected the image.
+    Attach,
+    /// A live X11 preview could not follow the pointer.
+    Move,
+    /// A live X11 preview could not redraw.
+    Redraw,
+}
+
 /// Terminal session outcome.
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[non_exhaustive]
@@ -358,6 +387,15 @@ pub enum SessionEvent {
         session: SessionId<Outbound>,
         /// Selected route.
         route: SessionRoute,
+    },
+    /// Native drag-preview attachment state.
+    Preview {
+        /// Session identity.
+        session: SessionId<Outbound>,
+        /// Selected native route.
+        route: SessionRoute,
+        /// Preview state.
+        status: PreviewStatus,
     },
     /// Target requested transfer data.
     DataRequested {
@@ -423,6 +461,11 @@ enum TicketEvent {
     Started {
         session: SessionId<Outbound>,
         route: SessionRoute,
+    },
+    Preview {
+        session: SessionId<Outbound>,
+        route: SessionRoute,
+        status: PreviewStatus,
     },
     DataRequested(SessionId<Outbound>),
     DropPerformed(SessionId<Outbound>),
@@ -550,6 +593,7 @@ impl StartTicket {
         let delivery = Arc::new(ReporterDelivery::new(inner.events.clone()));
         let reporter = SessionReporter {
             session: inner.session,
+            route: inner.route,
             terminal: Arc::clone(&terminal),
             delivery: Arc::clone(&delivery),
         };
@@ -635,6 +679,7 @@ impl StartTicket {
         let delivery = Arc::new(ReporterDelivery::new(inner.events.clone()));
         let reporter = SessionReporter {
             session: inner.session,
+            route: inner.route,
             terminal: Arc::clone(&terminal),
             delivery: Arc::clone(&delivery),
         };
@@ -685,6 +730,7 @@ impl StartTicket {
         let delivery = Arc::new(ReporterDelivery::new(inner.events.clone()));
         let reporter = SessionReporter {
             session: inner.session,
+            route: inner.route,
             terminal: Arc::clone(&terminal),
             delivery: Arc::clone(&delivery),
         };
@@ -930,11 +976,23 @@ impl Error for OriginError {
 #[derive(Clone)]
 pub struct SessionReporter {
     session: SessionId<Outbound>,
+    route: SessionRoute,
     terminal: Arc<AtomicBool>,
     delivery: Arc<ReporterDelivery>,
 }
 
 impl SessionReporter {
+    /// Report the non-terminal native preview state.
+    pub fn preview(&self, status: PreviewStatus) {
+        if !self.terminal.load(Ordering::Acquire) {
+            self.delivery.emit(TicketEvent::Preview {
+                session: self.session,
+                route: self.route,
+                status,
+            });
+        }
+    }
+
     /// Report that the target requested file data.
     pub fn data_requested(&self) {
         if !self.terminal.load(Ordering::Acquire) {
@@ -1422,6 +1480,17 @@ impl Controller {
                 self.pending
                     .push(SessionEvent::OutboundStarted { session, route });
             }
+            TicketEvent::Preview {
+                session,
+                route,
+                status,
+            } if self.is_live(session) => {
+                self.pending.push(SessionEvent::Preview {
+                    session,
+                    route,
+                    status,
+                });
+            }
             TicketEvent::DataRequested(session) => {
                 if let Some(active) = &mut self.active_outbound
                     && active.session == session
@@ -1450,7 +1519,9 @@ impl Controller {
             TicketEvent::Terminal { session, outcome } if self.is_live(session) => {
                 self.finish_outbound(session, outcome);
             }
-            TicketEvent::Started { .. } | TicketEvent::Terminal { .. } => {}
+            TicketEvent::Started { .. }
+            | TicketEvent::Preview { .. }
+            | TicketEvent::Terminal { .. } => {}
         }
     }
 

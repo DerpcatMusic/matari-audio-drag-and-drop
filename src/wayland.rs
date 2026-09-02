@@ -56,6 +56,7 @@ impl WaylandSourceReporter {
     /// This is non-terminal and deliberately does not report a performed
     /// drop. The native source must remain alive for late MIME requests and
     /// authoritative `dnd_finished` or `cancelled` events.
+    #[cfg(target_os = "linux")]
     pub(crate) fn bridge_payload_transferred(&mut self) {
         self.reporter.data_requested();
         self.data_requested = true;
