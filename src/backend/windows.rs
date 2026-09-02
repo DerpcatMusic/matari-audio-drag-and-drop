@@ -2,12 +2,13 @@ use std::mem::{ManuallyDrop, size_of, zeroed};
 use std::os::windows::ffi::OsStrExt;
 use std::path::PathBuf;
 use std::ptr;
+use std::sync::Mutex;
 
 use raw_window_handle::RawWindowHandle;
 use windows::Win32::Foundation::{
     COLORREF, DRAGDROP_S_CANCEL, DRAGDROP_S_DROP, DRAGDROP_S_USEDEFAULTCURSORS, DV_E_FORMATETC,
-    E_NOTIMPL, GlobalFree, HGLOBAL, HWND, OLE_E_ADVISENOTSUPPORTED, POINT, RPC_E_CHANGED_MODE,
-    SIZE,
+    E_NOTIMPL, GlobalFree, HANDLE, HGLOBAL, HWND, OLE_E_ADVISENOTSUPPORTED, POINT,
+    RPC_E_CHANGED_MODE, SIZE,
 };
 use windows::Win32::Graphics::Gdi::{
     BI_RGB, BITMAPINFO, BITMAPINFOHEADER, CreateDIBSection, DIB_RGB_COLORS, DeleteObject, HBITMAP,
@@ -21,8 +22,8 @@ use windows::Win32::System::Com::{
 use windows::Win32::System::DataExchange::RegisterClipboardFormatW;
 use windows::Win32::System::Memory::{GHND, GlobalAlloc, GlobalLock, GlobalUnlock};
 use windows::Win32::System::Ole::{
-    CF_HDROP, DROPEFFECT, DROPEFFECT_COPY, DoDragDrop, IDropSource, IDropSource_Impl,
-    OleInitialize, OleUninitialize,
+    CF_HDROP, CLIPBOARD_FORMAT, DROPEFFECT, DROPEFFECT_COPY, DoDragDrop, IDropSource,
+    IDropSource_Impl, OleDuplicateData, OleInitialize, OleUninitialize,
 };
 use windows::Win32::System::SystemServices::{MK_LBUTTON, MODIFIERKEYS_FLAGS};
 use windows::Win32::UI::Shell::{
@@ -34,7 +35,10 @@ use windows_core::{BOOL, HRESULT, IUnknown, PCWSTR, Ref, Result};
 
 use super::ExternalDragPayload;
 use super::{DragWindow, ExternalDragError};
-use crate::{DragPreview, FailureKind, FailureStage, Outcome, SessionFailure, SessionReporter};
+use crate::{
+    DragPreview, FailureKind, FailureStage, Outcome, PreviewFailureStage, PreviewStatus,
+    SessionFailure, SessionReporter,
+};
 
 pub(super) fn start_external_file_drag(
     window: DragWindow<'_>,
@@ -62,9 +66,26 @@ pub(super) fn start_external_file_drag(
     let data_object: IDataObject = FileDataObject::new(paths)?.into();
     let drop_source: IDropSource = FileDropSource.into();
     let mut effect = DROPEFFECT(0);
-    let _drag_bitmap = preview
-        .as_ref()
-        .and_then(|preview| attach_drag_image(&data_object, preview).ok());
+    let _drag_bitmap =
+        preview
+            .as_ref()
+            .and_then(|preview| match attach_drag_image(&data_object, preview) {
+                Ok(bitmap) => {
+                    if let Some(reporter) = &reporter {
+                        reporter.preview(PreviewStatus::Attached);
+                    }
+                    Some(bitmap)
+                }
+                Err(error) => {
+                    if let Some(reporter) = &reporter {
+                        reporter.preview(PreviewStatus::Unavailable {
+                            stage: error.stage,
+                            native_code: error.native_code,
+                        });
+                    }
+                    None
+                }
+            });
     // SAFETY: OLE is initialized on this GUI thread, both COM interfaces remain
     // alive for the call, and `effect` is a writable `DROPEFFECT`.
     unsafe {
@@ -111,17 +132,17 @@ impl Drop for DragBitmapGuard {
 fn attach_drag_image(
     data_object: &IDataObject,
     preview: &DragPreview,
-) -> std::result::Result<DragBitmapGuard, String> {
+) -> std::result::Result<DragBitmapGuard, PreviewAttachError> {
     let pixels = crate::preview::render(preview);
-    let bitmap = DragBitmapGuard(create_drag_bitmap(
-        &pixels,
-        crate::preview::WIDTH,
-        crate::preview::HEIGHT,
-    )?);
+    let bitmap = DragBitmapGuard(
+        create_drag_bitmap(&pixels, crate::preview::WIDTH, crate::preview::HEIGHT)
+            .map_err(|_| PreviewAttachError::new(PreviewFailureStage::Bitmap, None))?,
+    );
     // SAFETY: `CLSID_DragDropHelper` identifies the in-process shell drag helper.
     let helper: IDragSourceHelper = unsafe {
-        CoCreateInstance(&CLSID_DragDropHelper, None, CLSCTX_INPROC_SERVER)
-            .map_err(|error| format!("IDragSourceHelper create failed: {error}"))?
+        CoCreateInstance(&CLSID_DragDropHelper, None, CLSCTX_INPROC_SERVER).map_err(|error| {
+            PreviewAttachError::new(PreviewFailureStage::Helper, Some(error.code().0))
+        })?
     };
     let image = SHDRAGIMAGE {
         sizeDragImage: SIZE {
@@ -140,9 +161,22 @@ fn attach_drag_image(
     unsafe {
         helper
             .InitializeFromBitmap(&image, data_object)
-            .map_err(|error| format!("InitializeFromBitmap failed: {error}"))?;
+            .map_err(|error| {
+                PreviewAttachError::new(PreviewFailureStage::Attach, Some(error.code().0))
+            })?;
     }
     Ok(bitmap)
+}
+
+struct PreviewAttachError {
+    stage: PreviewFailureStage,
+    native_code: Option<i32>,
+}
+
+impl PreviewAttachError {
+    fn new(stage: PreviewFailureStage, native_code: Option<i32>) -> Self {
+        Self { stage, native_code }
+    }
 }
 
 fn create_drag_bitmap(
@@ -245,6 +279,7 @@ fn validate_paths(paths: &[PathBuf]) -> std::result::Result<(), String> {
 struct FileDataObject {
     paths: Vec<PathBuf>,
     formats: ShellDragFormats,
+    stored: Mutex<Vec<StoredHGlobal>>,
 }
 
 impl FileDataObject {
@@ -252,6 +287,7 @@ impl FileDataObject {
         Ok(Self {
             paths,
             formats: ShellDragFormats::new()?,
+            stored: Mutex::new(Vec::new()),
         })
     }
 
@@ -304,6 +340,19 @@ impl FileDataObject {
         let wide = path.as_os_str().encode_wide().collect::<Vec<_>>();
         Ok(build_wide_string_hglobal(&wide)?.into_medium())
     }
+
+    fn stored_medium(&self, format: &FORMATETC) -> Result<STGMEDIUM> {
+        let stored = self
+            .stored
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        stored
+            .iter()
+            .find(|stored| stored.matches(format))
+            .map(StoredHGlobal::duplicate_medium)
+            .transpose()?
+            .ok_or_else(|| DV_E_FORMATETC.into())
+    }
 }
 
 #[allow(non_snake_case)]
@@ -315,7 +364,9 @@ impl IDataObject_Impl for FileDataObject_Impl {
             Some(ShellDragFormat::Hdrop) => self.hdrop_medium(),
             Some(ShellDragFormat::PreferredDropEffect(_)) => self.preferred_drop_effect_medium(),
             Some(ShellDragFormat::FileNameW(_)) => self.filenamew_medium(),
-            None => Err(DV_E_FORMATETC.into()),
+            None => unsafe { pformatetcin.as_ref() }
+                .ok_or_else(|| windows_core::Error::from(DV_E_FORMATETC))
+                .and_then(|format| self.stored_medium(format)),
         }
     }
 
@@ -326,7 +377,14 @@ impl IDataObject_Impl for FileDataObject_Impl {
     fn QueryGetData(&self, pformatetc: *const FORMATETC) -> HRESULT {
         // SAFETY: COM requires `pformatetc` to be null or a readable
         // `FORMATETC` for the duration of `QueryGetData`.
-        if unsafe { self.requested_format(pformatetc) }.is_some() {
+        let stored = unsafe { pformatetc.as_ref() }.is_some_and(|format| {
+            self.stored
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .iter()
+                .any(|stored| stored.matches(format))
+        });
+        if unsafe { self.requested_format(pformatetc) }.is_some() || stored {
             HRESULT(0)
         } else {
             DV_E_FORMATETC
@@ -343,11 +401,43 @@ impl IDataObject_Impl for FileDataObject_Impl {
 
     fn SetData(
         &self,
-        _pformatetc: *const FORMATETC,
-        _pmedium: *const STGMEDIUM,
-        _frelease: BOOL,
+        pformatetc: *const FORMATETC,
+        pmedium: *const STGMEDIUM,
+        frelease: BOOL,
     ) -> Result<()> {
-        Err(E_NOTIMPL.into())
+        // SAFETY: COM requires both pointers to remain readable for this call.
+        let (Some(format), Some(medium)) =
+            (unsafe { pformatetc.as_ref() }, unsafe { pmedium.as_ref() })
+        else {
+            return Err(DV_E_FORMATETC.into());
+        };
+        if !format.ptd.is_null()
+            || format.dwAspect != DVASPECT_CONTENT.0
+            || format.lindex != -1
+            || medium.tymed != TYMED_HGLOBAL.0 as u32
+            || (format.tymed & TYMED_HGLOBAL.0 as u32) == 0
+        {
+            return Err(DV_E_FORMATETC.into());
+        }
+        // SAFETY: `medium.tymed` is TYMED_HGLOBAL, so this union field is live.
+        let source = unsafe { medium.u.hGlobal };
+        let stored = StoredHGlobal::duplicate(format, source)?;
+        let mut formats = self
+            .stored
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(existing) = formats.iter_mut().find(|item| item.same_format(format)) {
+            *existing = stored;
+        } else {
+            formats.push(stored);
+        }
+        drop(formats);
+        if frelease.as_bool() {
+            // SAFETY: Successful SetData with `frelease` transfers ownership.
+            let mut transferred = unsafe { ptr::read(pmedium) };
+            unsafe { windows::Win32::System::Ole::ReleaseStgMedium(&mut transferred) };
+        }
+        Ok(())
     }
 
     fn EnumFormatEtc(&self, dwdirection: u32) -> Result<IEnumFORMATETC> {
@@ -357,6 +447,13 @@ impl IDataObject_Impl for FileDataObject_Impl {
                 .formats()
                 .into_iter()
                 .map(|format| FileDataObject::format(format.clipboard_format()))
+                .chain(
+                    self.stored
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .iter()
+                        .map(StoredHGlobal::format),
+                )
                 .collect::<Vec<_>>();
             // SAFETY: `formats` is initialized and valid for the call;
             // `SHCreateStdEnumFmtEtc` copies the entries into the enumerator.
@@ -381,6 +478,74 @@ impl IDataObject_Impl for FileDataObject_Impl {
 
     fn EnumDAdvise(&self) -> Result<IEnumSTATDATA> {
         Err(OLE_E_ADVISENOTSUPPORTED.into())
+    }
+}
+
+struct StoredHGlobal {
+    clipboard_format: u16,
+    aspect: u32,
+    index: i32,
+    handle: usize,
+}
+
+impl StoredHGlobal {
+    fn duplicate(format: &FORMATETC, source: HGLOBAL) -> Result<Self> {
+        // SAFETY: OLE duplicates the live HGLOBAL into an independently owned
+        // allocation suitable for the same clipboard format.
+        let duplicate =
+            unsafe { OleDuplicateData(HANDLE(source.0), CLIPBOARD_FORMAT(format.cfFormat), GHND) };
+        if duplicate.0.is_null() {
+            return Err(windows_core::Error::from_thread());
+        }
+        Ok(Self {
+            clipboard_format: format.cfFormat,
+            aspect: format.dwAspect,
+            index: format.lindex,
+            handle: duplicate.0 as usize,
+        })
+    }
+
+    fn same_format(&self, format: &FORMATETC) -> bool {
+        self.clipboard_format == format.cfFormat
+            && self.aspect == format.dwAspect
+            && self.index == format.lindex
+    }
+
+    fn matches(&self, format: &FORMATETC) -> bool {
+        format.ptd.is_null()
+            && (format.tymed & TYMED_HGLOBAL.0 as u32) != 0
+            && self.same_format(format)
+    }
+
+    fn format(&self) -> FORMATETC {
+        FORMATETC {
+            cfFormat: self.clipboard_format,
+            ptd: ptr::null_mut(),
+            dwAspect: self.aspect,
+            lindex: self.index,
+            tymed: TYMED_HGLOBAL.0 as u32,
+        }
+    }
+
+    fn duplicate_medium(&self) -> Result<STGMEDIUM> {
+        Self::duplicate(&self.format(), HGLOBAL(self.handle as *mut _)).map(|copy| {
+            let handle = copy.handle;
+            std::mem::forget(copy);
+            STGMEDIUM {
+                tymed: TYMED_HGLOBAL.0 as u32,
+                u: STGMEDIUM_0 {
+                    hGlobal: HGLOBAL(handle as *mut _),
+                },
+                pUnkForRelease: ManuallyDrop::new(None::<IUnknown>),
+            }
+        })
+    }
+}
+
+impl Drop for StoredHGlobal {
+    fn drop(&mut self) {
+        // SAFETY: This value exclusively owns the duplicated allocation.
+        let _ = unsafe { GlobalFree(Some(HGLOBAL(self.handle as *mut _))) };
     }
 }
 

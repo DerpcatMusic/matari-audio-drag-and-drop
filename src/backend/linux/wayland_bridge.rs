@@ -41,8 +41,8 @@ use wayland_client::{
 };
 
 use crate::{
-    FailureKind, FailureStage, FileDragOffer, FileSet, LinuxOutcome, Outcome, SessionFailure,
-    SessionReporter, WaylandSourceReporter,
+    FailureKind, FailureStage, FileDragOffer, FileSet, LinuxOutcome, Outcome, PreviewStatus,
+    SessionFailure, SessionReporter, WaylandSourceReporter,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -358,6 +358,9 @@ impl BridgeState {
             .preview()
             .map(|preview| DragIcon::new(&self.compositor, &self.shm, &self.queue, preview))
             .transpose()?;
+        if icon.is_some() {
+            reporter.preview(PreviewStatus::Attached);
+        }
         let source = self.manager.create_drag_and_drop_source(
             &self.queue,
             offers.iter().map(FileDragOffer::mime_type),

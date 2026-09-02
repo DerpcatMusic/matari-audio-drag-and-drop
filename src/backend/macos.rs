@@ -17,7 +17,7 @@ use raw_window_handle::RawWindowHandle;
 
 use super::ExternalDragPayload;
 use super::{DragWindow, ExternalDragError};
-use crate::{DragPreview, Outcome, SessionReporter};
+use crate::{DragPreview, Outcome, PreviewFailureStage, PreviewStatus, SessionReporter};
 
 struct DragSourceIvars {
     reporter: Mutex<Option<SessionReporter>>,
@@ -147,8 +147,24 @@ fn start_drag_from_view(
     mtm: MainThreadMarker,
 ) {
     let location = event.locationInWindow();
-    let image = preview.map(ns_image_from_preview);
+    let image = preview.and_then(|preview| match ns_image_from_preview(preview) {
+        Ok(image) => Some(image),
+        Err(stage) => {
+            if let Some(reporter) = &reporter {
+                reporter.preview(PreviewStatus::Unavailable {
+                    stage,
+                    native_code: None,
+                });
+            }
+            None
+        }
+    });
     let items = dragging_items(paths, location, image.as_ref());
+    if image.is_some()
+        && let Some(reporter) = &reporter
+    {
+        reporter.preview(PreviewStatus::Attached);
+    }
     let item_refs = items.iter().map(|item| &**item).collect::<Vec<_>>();
     let item_array = NSArray::from_slice(&item_refs);
     let source = MatariExternalDragSource::new(mtm, reporter);
@@ -200,7 +216,7 @@ fn dragging_items(
         .collect()
 }
 
-fn ns_image_from_preview(preview: &DragPreview) -> Retained<NSImage> {
+fn ns_image_from_preview(preview: &DragPreview) -> Result<Retained<NSImage>, PreviewFailureStage> {
     let pixels = crate::preview::render(preview);
     let width = crate::preview::WIDTH;
     let height = crate::preview::HEIGHT;
@@ -222,19 +238,20 @@ fn ns_image_from_preview(preview: &DragPreview) -> Retained<NSImage> {
             32,
         )
     }) else {
-        return image;
+        return Err(PreviewFailureStage::Bitmap);
     };
     let destination = bitmap.bitmapData();
-    if !destination.is_null() {
-        // SAFETY: AppKit allocated at least `width * height * 4` bytes for the
-        // bitmap layout above, and `pixels` has exactly that length.
-        unsafe {
-            ptr::copy_nonoverlapping(pixels.as_ptr(), destination, pixels.len());
-        }
+    if destination.is_null() {
+        return Err(PreviewFailureStage::Bitmap);
+    }
+    // SAFETY: AppKit allocated at least `width * height * 4` bytes for the
+    // bitmap layout above, and `pixels` has exactly that length.
+    unsafe {
+        ptr::copy_nonoverlapping(pixels.as_ptr(), destination, pixels.len());
     }
     let representation: &NSImageRep = bitmap.as_ref();
     image.addRepresentation(representation);
-    image
+    Ok(image)
 }
 
 fn validate_paths(paths: &[PathBuf]) -> Result<(), String> {

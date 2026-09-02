@@ -24,8 +24,8 @@ pub use facade::{
     Controller, DragOrigin, FailureKind, FailureStage, FileSet, FileSetError, Inbound,
     InboundDecision, InboundDisposition, InboundError, InboundHandler, InboundOffer, LinuxFailure,
     LinuxOutcome, LinuxRejector, NativeProtocol, NativeReporter, NativeRuntime, NativeRuntimePort,
-    NativeStartError, OriginError, Outbound, Outcome, ProtocolError, RejectReason, RejectedStart,
-    SessionEvent, SessionFailure, SessionId, SessionReporter, SessionRoute, SourceContext,
-    StartError, StartTicket, ToolkitAdapter, Update, WaylandReporter, WaylandRuntimePort,
-    WaylandStartError,
+    NativeStartError, OriginError, Outbound, Outcome, PreviewFailureStage, PreviewStatus,
+    ProtocolError, RejectReason, RejectedStart, SessionEvent, SessionFailure, SessionId,
+    SessionReporter, SessionRoute, SourceContext, StartError, StartTicket, ToolkitAdapter, Update,
+    WaylandReporter, WaylandRuntimePort, WaylandStartError,
 };
