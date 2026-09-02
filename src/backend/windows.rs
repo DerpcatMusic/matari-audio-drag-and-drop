@@ -6,18 +6,16 @@ use std::sync::Mutex;
 
 use raw_window_handle::RawWindowHandle;
 use windows::Win32::Foundation::{
-    COLORREF, DRAGDROP_S_CANCEL, DRAGDROP_S_DROP, DRAGDROP_S_USEDEFAULTCURSORS, DV_E_FORMATETC,
-    E_NOTIMPL, GlobalFree, HANDLE, HGLOBAL, HWND, OLE_E_ADVISENOTSUPPORTED, POINT,
-    RPC_E_CHANGED_MODE, SIZE,
+    DRAGDROP_S_CANCEL, DRAGDROP_S_DROP, DRAGDROP_S_USEDEFAULTCURSORS, DV_E_FORMATETC, E_NOTIMPL,
+    GlobalFree, HANDLE, HGLOBAL, HWND, OLE_E_ADVISENOTSUPPORTED, POINT, RPC_E_CHANGED_MODE,
 };
 use windows::Win32::Graphics::Gdi::{
     BI_RGB, BITMAPINFO, BITMAPINFOHEADER, CreateDIBSection, DIB_RGB_COLORS, DeleteObject, HBITMAP,
     HDC,
 };
 use windows::Win32::System::Com::{
-    CLSCTX_INPROC_SERVER, CoCreateInstance, DATADIR_GET, DVASPECT_CONTENT, FORMATETC, IAdviseSink,
-    IDataObject, IDataObject_Impl, IEnumFORMATETC, IEnumSTATDATA, STGMEDIUM, STGMEDIUM_0,
-    TYMED_HGLOBAL,
+    DATADIR_GET, DVASPECT_CONTENT, FORMATETC, IAdviseSink, IDataObject, IDataObject_Impl,
+    IEnumFORMATETC, IEnumSTATDATA, STGMEDIUM, STGMEDIUM_0, TYMED_HGLOBAL,
 };
 use windows::Win32::System::DataExchange::RegisterClipboardFormatW;
 use windows::Win32::System::Memory::{GHND, GlobalAlloc, GlobalLock, GlobalUnlock};
@@ -26,10 +24,15 @@ use windows::Win32::System::Ole::{
     IDropSource_Impl, OleDuplicateData, OleInitialize, OleUninitialize,
 };
 use windows::Win32::System::SystemServices::{MK_LBUTTON, MODIFIERKEYS_FLAGS};
-use windows::Win32::UI::Shell::{
-    CFSTR_FILENAMEW, CFSTR_PREFERREDDROPEFFECT, CLSID_DragDropHelper, DROPFILES, IDragSourceHelper,
-    SHCreateStdEnumFmtEtc, SHDRAGIMAGE,
+use windows::Win32::UI::Controls::{
+    HIMAGELIST, ILC_COLOR32, ImageList_Add, ImageList_BeginDrag, ImageList_Create,
+    ImageList_Destroy, ImageList_DragEnter, ImageList_DragLeave, ImageList_DragMove,
+    ImageList_EndDrag,
 };
+use windows::Win32::UI::Shell::{
+    CFSTR_FILENAMEW, CFSTR_PREFERREDDROPEFFECT, DROPFILES, SHCreateStdEnumFmtEtc,
+};
+use windows::Win32::UI::WindowsAndMessaging::GetCursorPos;
 use windows::core::implement;
 use windows_core::{BOOL, HRESULT, IUnknown, PCWSTR, Ref, Result};
 
@@ -64,14 +67,14 @@ pub(super) fn start_external_file_drag(
 
     let _ole = OleDragApartment::initialize()?;
     let data_object: IDataObject = FileDataObject::new(paths)?.into();
-    let drop_source: IDropSource = FileDropSource.into();
-    let mut effect = DROPEFFECT(0);
-    if let Some(preview) = &preview {
-        match attach_drag_image(&data_object, preview) {
-            Ok(()) => {
+    let drag_image = preview
+        .as_ref()
+        .and_then(|preview| match SourceDragImage::new(preview) {
+            Ok(image) => {
                 if let Some(reporter) = &reporter {
                     reporter.preview(PreviewStatus::Attached);
                 }
+                Some(image)
             }
             Err(error) => {
                 if let Some(reporter) = &reporter {
@@ -80,9 +83,11 @@ pub(super) fn start_external_file_drag(
                         native_code: error.native_code,
                     });
                 }
+                None
             }
-        }
-    }
+        });
+    let drop_source: IDropSource = FileDropSource { drag_image }.into();
+    let mut effect = DROPEFFECT(0);
     // SAFETY: OLE is initialized on this GUI thread, both COM interfaces remain
     // alive for the call, and `effect` is a writable `DROPEFFECT`.
     unsafe {
@@ -126,44 +131,70 @@ impl Drop for DragBitmapGuard {
     }
 }
 
-fn attach_drag_image(
-    data_object: &IDataObject,
-    preview: &DragPreview,
-) -> std::result::Result<(), PreviewAttachError> {
-    let pixels = crate::preview::render(preview);
-    let bitmap = DragBitmapGuard(
-        create_drag_bitmap(&pixels, crate::preview::WIDTH, crate::preview::HEIGHT)
-            .map_err(|_| PreviewAttachError::new(PreviewFailureStage::Bitmap, None))?,
-    );
-    // SAFETY: `CLSID_DragDropHelper` identifies the in-process shell drag helper.
-    let helper: IDragSourceHelper = unsafe {
-        CoCreateInstance(&CLSID_DragDropHelper, None, CLSCTX_INPROC_SERVER).map_err(|error| {
-            PreviewAttachError::new(PreviewFailureStage::Helper, Some(error.code().0))
-        })?
-    };
-    let image = SHDRAGIMAGE {
-        sizeDragImage: SIZE {
-            cx: crate::preview::WIDTH as i32,
-            cy: crate::preview::HEIGHT as i32,
-        },
-        ptOffset: POINT {
-            x: crate::preview::WIDTH as i32 / 2,
-            y: crate::preview::HEIGHT as i32 / 2,
-        },
-        hbmpDragImage: bitmap.0,
-        crColorKey: COLORREF(u32::MAX),
-    };
-    // SAFETY: `image` and `data_object` remain valid for the call. On success
-    // the shell helper takes ownership of the bitmap.
-    unsafe {
-        helper
-            .InitializeFromBitmap(&image, data_object)
-            .map_err(|error| {
-                PreviewAttachError::new(PreviewFailureStage::Attach, Some(error.code().0))
-            })?;
+struct SourceDragImage(HIMAGELIST);
+
+impl SourceDragImage {
+    fn new(preview: &DragPreview) -> std::result::Result<Self, PreviewAttachError> {
+        let pixels = crate::preview::render(preview);
+        let bitmap = DragBitmapGuard(
+            create_drag_bitmap(&pixels, crate::preview::WIDTH, crate::preview::HEIGHT)
+                .map_err(|_| PreviewAttachError::new(PreviewFailureStage::Bitmap, None))?,
+        );
+        // SAFETY: The image list copies the live bitmap before the bitmap guard is dropped.
+        let list = unsafe {
+            ImageList_Create(
+                crate::preview::WIDTH as i32,
+                crate::preview::HEIGHT as i32,
+                ILC_COLOR32,
+                1,
+                0,
+            )
+        };
+        if list.is_invalid() || unsafe { ImageList_Add(list, bitmap.0, None) } < 0 {
+            if !list.is_invalid() {
+                let _ = unsafe { ImageList_Destroy(Some(list)) };
+            }
+            return Err(PreviewAttachError::new(PreviewFailureStage::Helper, None));
+        }
+        if !unsafe {
+            ImageList_BeginDrag(
+                list,
+                0,
+                crate::preview::WIDTH as i32 / 2,
+                crate::preview::HEIGHT as i32 / 2,
+            )
+        }
+        .as_bool()
+        {
+            let _ = unsafe { ImageList_Destroy(Some(list)) };
+            return Err(PreviewAttachError::new(PreviewFailureStage::Attach, None));
+        }
+        let mut cursor = POINT::default();
+        unsafe {
+            let _ = GetCursorPos(&mut cursor);
+            let _ = ImageList_DragEnter(HWND::default(), cursor.x, cursor.y);
+        }
+        Ok(Self(list))
     }
-    std::mem::forget(bitmap);
-    Ok(())
+
+    fn move_to_cursor(&self) {
+        let mut cursor = POINT::default();
+        unsafe {
+            if GetCursorPos(&mut cursor).is_ok() {
+                let _ = ImageList_DragMove(cursor.x, cursor.y);
+            }
+        }
+    }
+}
+
+impl Drop for SourceDragImage {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = ImageList_DragLeave(HWND::default());
+            ImageList_EndDrag();
+            let _ = ImageList_Destroy(Some(self.0));
+        }
+    }
 }
 
 struct PreviewAttachError {
@@ -224,13 +255,7 @@ fn create_drag_bitmap(
     for y in 0..height {
         let source_row = &rgba[y * stride..(y + 1) * stride];
         let destination_row = &mut destination[(height - 1 - y) * stride..(height - y) * stride];
-        for x in 0..width {
-            let offset = x * 4;
-            destination_row[offset] = source_row[offset + 2];
-            destination_row[offset + 1] = source_row[offset + 1];
-            destination_row[offset + 2] = source_row[offset];
-            destination_row[offset + 3] = source_row[offset + 3];
-        }
+        destination_row.copy_from_slice(source_row);
     }
     Ok(bitmap)
 }
@@ -604,11 +629,16 @@ fn registered_clipboard_format(name: PCWSTR) -> Option<u16> {
 }
 
 #[implement(IDropSource)]
-struct FileDropSource;
+struct FileDropSource {
+    drag_image: Option<SourceDragImage>,
+}
 
 #[allow(non_snake_case)]
 impl IDropSource_Impl for FileDropSource_Impl {
     fn QueryContinueDrag(&self, fescapepressed: BOOL, grfkeystate: MODIFIERKEYS_FLAGS) -> HRESULT {
+        if let Some(image) = &self.drag_image {
+            image.move_to_cursor();
+        }
         if fescapepressed.as_bool() {
             DRAGDROP_S_CANCEL
         } else if (grfkeystate.0 & MK_LBUTTON.0) == 0 {
